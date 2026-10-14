@@ -1,5 +1,7 @@
 # Del-Discord
 
+Delete your Discord messages, remove reactions, and manage cleanup queues from one browser toolbar.
+
 [![Version: v2.1.1][version-badge]][script]
 [![License: MIT][license-badge]][license]
 
@@ -12,6 +14,8 @@
 ## Demo
 
 [![Del-Discord demo showing message cleanup and reaction removal][demo-preview]][demo-video]
+
+Found this useful? [Star the repository](https://github.com/azhomy/Del-Discord).
 
 ---
 
@@ -76,7 +80,7 @@ Still having installation trouble? [Open an installation bug report][bug-report]
 [tampermonkey]: https://www.tampermonkey.net/
 [violentmonkey]: https://violentmonkey.github.io/
 [greasemonkey]: https://addons.mozilla.org/firefox/addon/greasemonkey/
-[bug-report]: https://github.com/zhomander/del-discord/issues/new?template=bugreport.yml
+[bug-report]: https://github.com/azhomy/del-discord/issues/new?template=bugreport.yml
 
 > [!WARNING]
 > Del-Discord automates actions on your user account. Discord prohibits this type of automation (self-bots), and using it may result in account suspension or termination. Randomized delays do not guarantee protection from detection. Read [Discord’s self-bot policy](https://support.discord.com/hc/en-us/articles/115002192352-Automated-User-Accounts-Self-Bots) before installing. Use at your own risk.
