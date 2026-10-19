@@ -1,6 +1,11 @@
 // Del-Discord v1 — personal source modules.
 
-export const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Browsers clamp overflowing timer delays to a few milliseconds. Split long
+// server cooldowns so an unusually large Retry-After never becomes an early retry.
+export const sleep = ms => {
+  const chunk = Math.min(ms, 2147483647);
+  return new Promise(resolve => setTimeout(resolve, chunk)).then(() => ms > chunk ? sleep(ms - chunk) : undefined);
+};
 
 export const rand = (a, b) => {
   const range = b - a + 1;

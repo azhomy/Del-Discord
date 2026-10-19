@@ -17,6 +17,15 @@ export async function sentCountForChannel(token, selfId, channelId) {
   }
 }
 
+async function closeTemporaryDm(token, channelId) {
+  try {
+    const response = await apiFetch(`${API}/channels/${channelId}`, { method: 'DELETE', headers: { Authorization: token } });
+    if (!response.ok && response.status !== 404) throw new Error(`HTTP ${response.status}`);
+  } catch (error) {
+    throw new Error(`Could not close the temporarily opened DM. It may remain open in your DM list. ${error.message || error}`, { cause: error });
+  }
+}
+
 export async function verifyPerson(token, selfId, userId, knownChannelId, wasOpen) {
   let channelId = knownChannelId || '';
   let temporarilyOpened = false;
@@ -32,8 +41,6 @@ export async function verifyPerson(token, selfId, userId, knownChannelId, wasOpe
     const count = await sentCountForChannel(token, selfId, channelId);
     return { count, channelId };
   } finally {
-    if (temporarilyOpened && channelId) {
-      try { await apiFetch(`${API}/channels/${channelId}`, { method: 'DELETE', headers: { Authorization: token } }); } catch {}
-    }
+    if (temporarilyOpened && channelId) await closeTemporaryDm(token, channelId);
   }
 }

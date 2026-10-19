@@ -134,13 +134,22 @@ export function initHistory(container, { deleteConversations = async () => [] } 
       if (entry.userId) {
         const open = document.createElement('button'); open.className = 'dmh-button green'; open.textContent = 'Open DM';
         open.onclick = async () => {
-          if (!me) me = await identity();
-          if (!me) return alert('Could not get a valid Discord authorization token.');
-          const r = await apiFetch(`${API}/users/@me/channels`, { method: 'POST', headers: { Authorization: me.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ recipient_id: entry.userId }) });
-          if (!r.ok) return alert(`Discord could not reopen this DM (HTTP ${r.status}).`);
-          const ch = await r.json();
-          merge(history, { userId: entry.userId, channelId: ch.id, sources: ['open'], sentCount: entry.sentCount, sentCountExact: entry.sentCountExact, verifiedSent: true, seenAt: new Date().toISOString() });
-          saveHistory(history); location.href = `/channels/@me/${ch.id}`;
+          const openingHistory = history;
+          try {
+            const currentIdentity = me || await identity();
+            if (history !== openingHistory) return;
+            me = currentIdentity;
+            if (!me) return alert('Could not get a valid Discord authorization token.');
+            const r = await apiFetch(`${API}/users/@me/channels`, { method: 'POST', headers: { Authorization: me.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ recipient_id: entry.userId }) });
+            if (history !== openingHistory) return;
+            if (!r.ok) return alert(`Discord could not reopen this DM (HTTP ${r.status}).`);
+            const ch = await r.json();
+            if (history !== openingHistory) return;
+            merge(history, { userId: entry.userId, channelId: ch.id, sources: ['open'], sentCount: entry.sentCount, sentCountExact: entry.sentCountExact, verifiedSent: true, seenAt: new Date().toISOString() });
+            saveHistory(history); location.href = `/channels/@me/${ch.id}`;
+          } catch (error) {
+            if (history === openingHistory) alert(`Discord could not reopen this DM: ${error?.message || error}`);
+          }
         };
         actions.appendChild(open);
       }
@@ -165,21 +174,24 @@ export function initHistory(container, { deleteConversations = async () => [] } 
   async function refreshLive() {
     if (refreshing) return;
     refreshing = true; $('#dmh-refresh').disabled = true; $('#dmh-summary').textContent = 'Loading Discord DM data…';
+    const refreshingHistory = history;
+    let dirty = 0;
     try {
-      me = await identity();
+      const refreshedIdentity = await identity();
+      if (history !== refreshingHistory) return;
+      me = refreshedIdentity;
       if (!me) { $('#dmh-summary').textContent = 'Could not get a valid Discord authorization token.'; return; }
       const openByUser = new Map();
-      try {
-        const r = await apiFetch(`${API}/users/@me/channels`, { headers: { Authorization: me.token } });
-        if (r.ok) {
-          const channels = await r.json();
-          for (const ch of Array.isArray(channels) ? channels : []) {
-            if (ch?.type !== 1) continue;
-            const u = ch.recipients?.find?.(v => v?.id && v.id !== me.user.id);
-            if (u) openByUser.set(u.id, { channelId: ch.id, user: u });
-          }
-        }
-      } catch {}
+      const r = await apiFetch(`${API}/users/@me/channels`, { headers: { Authorization: me.token } });
+      if (history !== refreshingHistory) return;
+      if (!r.ok) throw new Error(`Could not load open DMs (HTTP ${r.status}).`);
+      const channels = await r.json();
+      if (history !== refreshingHistory) return;
+      for (const ch of Array.isArray(channels) ? channels : []) {
+        if (ch?.type !== 1) continue;
+        const u = ch.recipients?.find?.(v => v?.id && v.id !== me.user.id);
+        if (u) openByUser.set(u.id, { channelId: ch.id, user: u });
+      }
 
       const candidates = new Map();
       for (const [userId, data] of openByUser) candidates.set(userId, { userId, channelId: data.channelId, user: data.user, wasOpen: true, dmRank: null, source: 'open' });
@@ -191,13 +203,14 @@ export function initHistory(container, { deleteConversations = async () => [] } 
 
       const all = [...candidates.values()];
       let done = 0;
-      let dirty = 0;
 
       for (const c of all) {
+        if (history !== refreshingHistory) return;
         done++;
         $('#dmh-summary').textContent = `Verifying sent-message history ${done}/${all.length}…`;
 
         const result = await verifyPerson(me.token, me.user.id, c.userId, c.channelId, c.wasOpen);
+        if (history !== refreshingHistory) return;
         if (!result || result.count === null) {
           await sleep(200);
           continue;
@@ -237,8 +250,14 @@ export function initHistory(container, { deleteConversations = async () => [] } 
         await sleep(250);
       }
 
+      if (history !== refreshingHistory) return;
       if (dirty) saveHistory(history);
       render();
+    } catch (error) {
+      if (history !== refreshingHistory) return;
+      if (dirty) saveHistory(history);
+      render(false);
+      $('#dmh-summary').textContent = `Refresh stopped: ${error?.message || error}`;
     } finally { $('#dmh-refresh').disabled = false; refreshing = false; }
   }
 

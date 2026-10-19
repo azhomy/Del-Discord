@@ -52,13 +52,6 @@ export function merge(map, incoming) {
 
   const previous = oldKey ? (map[oldKey] || {}) : (map[key] || {});
 
-  if (oldKey && oldKey !== key) {
-    delete map[oldKey];
-
-    if (previous.userId) indexes.byUser.delete(previous.userId);
-    if (previous.channelId) indexes.byChannel.delete(previous.channelId);
-  }
-
   const merged = {
     userId: incoming.userId || previous.userId || '',
     channelId: incoming.channelId || previous.channelId || '',
@@ -81,6 +74,12 @@ export function merge(map, incoming) {
     sentCountExact: incoming.sentCountExact === true || previous.sentCountExact === true,
     verifiedSent: incoming.verifiedSent === true || previous.verifiedSent === true
   };
+
+  if (oldKey && oldKey !== key) delete map[oldKey];
+  // Replacing an identifier must retire its old lookup even when the map key
+  // stays the same (for example, a user's channel ID is updated).
+  if (previous.userId && previous.userId !== merged.userId && indexes.byUser.get(previous.userId) === oldKey) indexes.byUser.delete(previous.userId);
+  if (previous.channelId && previous.channelId !== merged.channelId && indexes.byChannel.get(previous.channelId) === oldKey) indexes.byChannel.delete(previous.channelId);
 
   map[key] = merged;
 

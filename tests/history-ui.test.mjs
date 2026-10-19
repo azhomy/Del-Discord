@@ -100,3 +100,118 @@ test('clearing history during name resolution cannot restore the cleared entries
   assert.equal($('#dmh-list').querySelectorAll('.dmh-row').length, 0);
   assert.equal(dom.window.localStorage.getItem('del_discord_v1_history'), '{}');
 });
+
+test('clearing history during verification discards the arriving result and remaining requests', async t => {
+  const { dom, $ } = mount(t, {});
+  let release;
+  const requests = [];
+  dom.window.fetch = async url => {
+    requests.push(url);
+    if (url.endsWith('/users/@me')) return Response.json({ id: self });
+    if (url.endsWith('/users/@me/channels')) return Response.json([
+      { id: channel, type: 1, recipients: [{ id: userId, username: 'First' }] },
+      { id: '456789012345678901', type: 1, recipients: [{ id: '567890123456789012', username: 'Second' }] }
+    ]);
+    return new Promise(resolve => { release = () => resolve(Response.json({ total_results: 2 })); });
+  };
+  const refresh = $('#dmh-refresh').onclick(); await settle();
+  assert.equal(typeof release, 'function');
+  $('#dmh-clear').click();
+  $('.dmd-confirm-actions .dmd-red').click(); await settle();
+  release(); await refresh;
+  assert.equal(requests.length, 3);
+  assert.equal($('#dmh-list').querySelectorAll('.dmh-row').length, 0);
+  assert.equal(dom.window.localStorage.getItem('del_discord_v1_history'), '{}');
+  assert.equal($('#dmh-refresh').disabled, false);
+});
+
+test('refresh rate-limit failures retain completed results and show why verification stopped', async t => {
+  const { dom, $ } = mount(t, {});
+  let limitedRequests = 0, laterRequests = 0;
+  dom.window.fetch = async url => {
+    if (url.endsWith('/users/@me')) return Response.json({ id: self });
+    if (url.endsWith('/users/@me/channels')) return Response.json([
+      { id: channel, type: 1, recipients: [{ id: userId, username: 'Verified' }] },
+      { id: '456789012345678901', type: 1, recipients: [{ id: '567890123456789012', username: 'Limited' }] },
+      { id: '678901234567890123', type: 1, recipients: [{ id: '789012345678901234', username: 'Later' }] },
+    ]);
+    if (url.includes(channel)) return Response.json({ total_results: 2 });
+    if (url.includes('456789012345678901')) { limitedRequests++; return Response.json({ retry_after: 0 }, { status: 429 }); }
+    laterRequests++; throw new Error('Later conversations must not be requested');
+  };
+  await assert.doesNotReject($('#dmh-refresh').onclick());
+  assert.equal(limitedRequests, 3); assert.equal(laterRequests, 0);
+  assert.match($('#dmh-summary').textContent, /Repeated rate limits/);
+  assert.equal($('#dmh-list .dmh-name').textContent, 'Verified');
+  const saved = JSON.parse(dom.window.localStorage.getItem('del_discord_v1_history'));
+  assert.equal(saved[`u:${userId}`].sentCount, 2);
+  assert.equal($('#dmh-refresh').disabled, false);
+});
+
+test('refresh reports a failure loading open conversations instead of silently showing an empty result', async t => {
+  const { dom, $ } = mount(t, {});
+  dom.window.fetch = async url => {
+    if (url.endsWith('/users/@me')) return Response.json({ id: self });
+    throw new Error('Connection interrupted');
+  };
+  await assert.doesNotReject($('#dmh-refresh').onclick());
+  assert.match($('#dmh-summary').textContent, /Connection interrupted/);
+  assert.equal($('#dmh-refresh').disabled, false);
+});
+
+test('clearing history before a verification failure suppresses stale error messages and saves', async t => {
+  const { dom, $ } = mount(t, {});
+  let fail;
+  dom.window.fetch = async url => {
+    if (url.endsWith('/users/@me')) return Response.json({ id: self });
+    if (url.endsWith('/users/@me/channels')) return Response.json([{ id: channel, type: 1, recipients: [{ id: userId, username: 'Person' }] }]);
+    return new Promise((_resolve, reject) => { fail = () => reject(new Error('Late connection failure')); });
+  };
+  const refresh = $('#dmh-refresh').onclick(); await settle();
+  assert.equal(typeof fail, 'function');
+  $('#dmh-clear').click(); $('.dmd-confirm-actions .dmd-red').click(); await settle();
+  fail(); await assert.doesNotReject(refresh);
+  assert.equal($('#dmh-summary').textContent, '');
+  assert.equal($('#dmh-list').querySelectorAll('.dmh-row').length, 0);
+  assert.equal(dom.window.localStorage.getItem('del_discord_v1_history'), '{}');
+});
+
+for (const stage of ['identity', 'channel', 'body']) test(`clearing history during Open DM ${stage} prevents stale restoration and navigation`, async t => {
+  const { dom, $ } = mount(t, { [`u:${userId}`]: { userId, channelId: channel, name: 'Person', username: 'Person', verifiedSent: true, sentCount: 3 } });
+  let release, opens = 0;
+  dom.window.fetch = async url => {
+    if (url.endsWith('/users/@me')) return stage === 'identity'
+      ? new Promise(resolve => { release = () => resolve(Response.json({ id: self })); }) : Response.json({ id: self });
+    opens++;
+    if (stage === 'channel') return new Promise(resolve => { release = () => resolve(Response.json({ id: channel })); });
+    if (stage === 'body') return { ok: true, status: 200, headers: new Headers(), json: () => new Promise(resolve => { release = () => resolve({ id: channel }); }) };
+    return Response.json({ id: channel });
+  };
+  const opening = $('.dmh-button.green').onclick(); await settle();
+  assert.equal(typeof release, 'function');
+  $('#dmh-clear').click(); $('.dmd-confirm-actions .dmd-red').click(); await settle();
+  release(); await assert.doesNotReject(opening);
+  assert.equal(opens, stage === 'identity' ? 0 : 1);
+  assert.equal(dom.window.localStorage.getItem('del_discord_v1_history'), '{}');
+  assert.equal($('#dmh-list').querySelectorAll('.dmh-row').length, 0);
+  assert.equal(dom.window.location.href, 'https://discord.com/');
+});
+
+for (const clear of [false, true]) test(`Open DM reports request errors only while its history is current (clear=${clear})`, async t => {
+  const { dom, $ } = mount(t, { [`u:${userId}`]: { userId, channelId: channel, name: 'Person', username: 'Person', verifiedSent: true, sentCount: 3 } });
+  let fail;
+  const alerts = [];
+  dom.window.alert = text => alerts.push(text);
+  dom.window.fetch = async url => {
+    if (url.endsWith('/users/@me')) return Response.json({ id: self });
+    return new Promise((_resolve, reject) => { fail = () => reject(new Error('Connection interrupted')); });
+  };
+  const opening = $('.dmh-button.green').onclick(); await settle();
+  assert.equal(typeof fail, 'function');
+  if (clear) { $('#dmh-clear').click(); $('.dmd-confirm-actions .dmd-red').click(); await settle(); }
+  fail(); await assert.doesNotReject(opening);
+  if (clear) {
+    assert.deepEqual(alerts, []);
+    assert.equal(dom.window.localStorage.getItem('del_discord_v1_history'), '{}');
+  } else assert.match(alerts[0], /Connection interrupted/);
+});

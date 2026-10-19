@@ -56,6 +56,10 @@ export async function cleanupForumThread(opts) {
     if (thread.id !== channelId || ![10, 11, 12].includes(thread.type)) throw new Error('Select an individual thread for thread cleanup.');
     const parent = await readJson(`${API}/channels/${thread.parent_id}`, options);
     if (!(opts.allowAnyThread ? [0, 5, 15, 16] : [15, 16]).includes(parent.type) || parent.guild_id !== options.guildId || parent.id !== thread.parent_id) throw new Error('This thread does not belong to the selected forum/server.');
+    if (parent.nsfw && !options.includeNsfw) {
+      log('info', 'Thread cleanup skipped because its parent is NSFW. Enable Include NSFW to clean it.');
+      return { done: true, ...stats };
+    }
     let before = options.maxId;
     while (!stopCheck()) {
       const query = new URLSearchParams({ limit: '100' });

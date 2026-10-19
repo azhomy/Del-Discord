@@ -35,13 +35,13 @@ test('both panels use v10 and rate-limit delays remain seconds at all magnitudes
   assert.ok(waits[0] >= 1000250 && waits[0] <= 1000750);
 });
 
-test('export stops on repeated pages and preserves unique ascending messages', async t => {
+test('export deduplicates overlapping pages and preserves unique ascending messages', async t => {
   t.mock.method(globalThis, 'setTimeout', callback => { callback(); return 0; });
   const urls = [];
   t.mock.method(globalThis, 'fetch', async url => {
     urls.push(url);
     if (urls.length > 3) throw new Error('Export should stop on a nonadvancing page');
-    return Response.json(urls.length === 1 ? [message('300'), message('200'), message('200')] : [message('200'), message('100')]);
+    return Response.json(urls.length === 1 ? [message('300'), message('200'), message('200')] : urls.length === 2 ? [message('200'), message('100')] : []);
   });
   const result = await exportConversationData(exportOptions);
   assert.deepEqual(result.messages.map(message => message.id), ['100', '200', '300']);
@@ -53,7 +53,7 @@ test('export stops on repeated pages and preserves unique ascending messages', a
 test('export cancellation during rate limiting prevents another request', async t => {
   let stopped = false, calls = 0;
   t.mock.method(globalThis, 'fetch', async () => { calls++; return Response.json({ retry_after: 0.1 }, { status: 429 }); });
-  t.mock.method(globalThis, 'setTimeout', callback => { stopped = true; callback(); return 0; });
+  t.mock.method(globalThis, 'setTimeout', callback => { if (calls) stopped = true; callback(); return 0; });
   const result = await exportConversationData({ ...exportOptions, stopCheck: () => stopped });
   assert.equal(calls, 1);
   assert.equal(result.messageCount, 0);
@@ -119,4 +119,27 @@ test('reaction cancellation during rate limiting prevents another request', asyn
   await removeReactions({ token: 'test', channelId: 'channel', scanLimit: 2, log: (...args) => logs.push(args) });
   assert.equal(calls, 1);
   assert.equal(logs.at(-1)[0], 'warn');
+});
+
+
+test('export validates ranges before requests and applies dates across paginated messages', async t => {
+  const { toSnowflake } = await import('../src/utils/messages.js');
+  const minId = '2026-01-01T00:00', maxId = '2026-02-01T00:00';
+  const lower = BigInt(toSnowflake(minId)), upper = BigInt(toSnowflake(maxId));
+  const urls = [];
+  t.mock.method(globalThis, 'setTimeout', callback => { callback(); return 0; });
+  t.mock.method(globalThis, 'fetch', async url => {
+    urls.push(url);
+    return Response.json(urls.length === 1
+      ? [message(String(upper)), message(String(upper - 1n))]
+      : [message(String(lower + 1n)), message(String(lower)), message(String(lower - 1n))]);
+  });
+  await assert.rejects(exportConversationData({ ...exportOptions, minId: 'invalid' }), /valid date/);
+  await assert.rejects(exportConversationData({ ...exportOptions, minId: maxId, maxId: minId }), /earlier/);
+  assert.equal(urls.length, 0);
+  const result = await exportConversationData({ ...exportOptions, minId, maxId });
+  assert.deepEqual(result.messages.map(item => item.id), [String(lower + 1n), String(upper - 1n)]);
+  assert.deepEqual(result.range, { after: minId, before: maxId });
+  assert.equal(new URL(urls[0]).searchParams.get('before'), String(upper));
+  assert.equal(urls.length, 2);
 });

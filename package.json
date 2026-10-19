@@ -1,6 +1,6 @@
 {
   "name": "del-discord",
-  "version": "2.1.1",
+  "version": "2.5.0",
   "private": true,
   "description": "Personal local Discord deletion and DM history userscript",
   "scripts": {
@@ -32,6 +32,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/zhomander/del-discord.git"
+    "url": "https://github.com/azhomy/del-discord.git"
   }
 }
