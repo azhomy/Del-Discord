@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Del-Discord
 // @namespace    local.del-discord
-// @version      2.1.1
+// @version      2.5.0
 // @author       Del-Discord contributors
 // @icon         data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBmaWxsPSIjOTY5NjkwIiBkPSJNMTUgNFYySDl2MkgzdjJoMThWNGgtNlpNNSA3djEyYTIgMiAwIDAgMCAyIDJoMTBhMiAyIDAgMCAwIDItMlY3SDVabTYgMTBIOXYtNmgydjZabTQgMGgtMnYtNmgydjZaIi8+PC9zdmc+
-// @homepageURL  https://github.com/zhomander/del-discord
-// @supportURL   https://github.com/zhomander/del-discord/issues
+// @homepageURL  https://github.com/azhomy/del-discord
+// @supportURL   https://github.com/azhomy/del-discord/issues
 // @license      MIT
 // @description  Personal message deletion, reaction removal, queues, exports, and DM history.
 // @match        https://discord.com/*
@@ -203,7 +203,10 @@ SOFTWARE.
   var AUTH_CACHE_TTL = 6e4;
 
   // src/utils/timing.js
-  var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  var sleep = (ms) => {
+    const chunk = Math.min(ms, 2147483647);
+    return new Promise((resolve) => setTimeout(resolve, chunk)).then(() => ms > chunk ? sleep(ms - chunk) : void 0);
+  };
   var rand = (a, b) => {
     const range = b - a + 1;
     if (globalThis.crypto?.getRandomValues && Number.isSafeInteger(range) && range > 0 && range <= 4294967296) {
@@ -221,6 +224,27 @@ SOFTWARE.
     return value !== null && value !== "" && Number.isFinite(seconds) && seconds >= 0 ? seconds * 1e3 : 1500;
   };
 
+  // src/utils/abort.js
+  function waitWithSignal(promise, signal) {
+    if (!signal) return promise;
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        cleanup();
+        reject(signal.reason || new DOMException("Stopped.", "AbortError"));
+      };
+      const cleanup = () => signal.removeEventListener("abort", abort);
+      promise.then((value) => {
+        cleanup();
+        resolve(value);
+      }, (error) => {
+        cleanup();
+        reject(error);
+      });
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+
   // src/discord/api.js
   var RunStoppedError = class extends Error {
     constructor() {
@@ -228,6 +252,34 @@ SOFTWARE.
       this.name = "RunStoppedError";
     }
   };
+  var RateLimitError = class extends Error {
+    constructor() {
+      super("Repeated rate limits. Requests stopped; wait before trying again.");
+      this.name = "RateLimitError";
+    }
+  };
+  var paceTail = Promise.resolve();
+  var lastPacedStart = null;
+  async function paceRequest(interval, stopCheck, signal) {
+    const previous = paceTail;
+    let release;
+    const turn = new Promise((resolve) => {
+      release = resolve;
+    });
+    paceTail = previous.then(() => turn);
+    try {
+      await waitWithSignal(previous, signal);
+      if (stopCheck()) throw new RunStoppedError();
+      if (lastPacedStart !== null) {
+        const wait = interval - (performance.now() - lastPacedStart);
+        if (wait > 0) await waitWithSignal(sleep(wait), signal);
+      }
+      if (stopCheck()) throw new RunStoppedError();
+      lastPacedStart = performance.now();
+    } finally {
+      release();
+    }
+  }
   var cooldowns = /* @__PURE__ */ new Map();
   function pauseAccount(key, milliseconds) {
     const previous = cooldowns.get(key);
@@ -238,17 +290,23 @@ SOFTWARE.
     return pause;
   }
   async function apiFetch(url, options = {}, log = () => {
-  }, stopCheck = () => false) {
-    const account = new Headers(options.headers).get("Authorization") || "";
+  }, stopCheck = () => false, { minIntervalMs = 0, maxRateLimitRetries = 2 } = {}) {
+    let retries = 0;
+    const account = new Headers(options.headers).get("Authorization") || new URL(url).origin;
     while (true) {
       if (stopCheck()) throw new RunStoppedError();
       let cooldown;
       while (cooldown = cooldowns.get(account)) {
-        await cooldown;
+        await waitWithSignal(cooldown, options.signal);
         if (stopCheck()) throw new RunStoppedError();
       }
+      if (minIntervalMs > 0) {
+        await paceRequest(minIntervalMs, stopCheck, options.signal);
+        if (cooldowns.has(account)) continue;
+      }
       if (stopCheck()) throw new RunStoppedError();
-      const response = await fetch(url, options);
+      options.signal?.throwIfAborted();
+      const response = await waitWithSignal(fetch(url, options), options.signal);
       if (response.status !== 429) {
         const reset = response.headers.get("X-RateLimit-Reset-After");
         if (response.headers.get("X-RateLimit-Remaining") === "0" && reset !== null && Number.isFinite(Number(reset)) && Number(reset) >= 0) {
@@ -258,12 +316,23 @@ SOFTWARE.
       }
       let body = {};
       try {
-        body = await response.json();
+        body = await waitWithSignal(response.json(), options.signal) || {};
       } catch {
       }
-      const wait = Math.max(retryMs(body.retry_after ?? response.headers.get("Retry-After")), response.headers.has("Retry-After") ? retryMs(response.headers.get("Retry-After")) : 0);
-      log("warn", `Rate limited. Waiting ${(wait / 1e3).toFixed(1)}s...`);
-      await pauseAccount(account, wait);
+      const seconds = (value) => value !== null && value !== "" && ["number", "string"].includes(typeof value) && Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) * 1e3 : null;
+      const header = response.headers.get("Retry-After");
+      let headerDelay = seconds(header);
+      if (headerDelay === null && header && /GMT$/i.test(header)) {
+        const date = Date.parse(header);
+        if (Number.isFinite(date)) headerDelay = Math.max(0, date - Date.now());
+      }
+      const hints = [seconds(body.retry_after), headerDelay, seconds(response.headers.get("X-RateLimit-Reset-After"))].filter((value) => value !== null);
+      const delay = hints.length ? Math.max(...hints) : Math.min(3e4, 1500 * 2 ** retries);
+      const pause = pauseAccount(account, delay);
+      options.signal?.throwIfAborted();
+      if (retries++ >= maxRateLimitRetries) throw new RateLimitError();
+      log("warn", `Rate limited. Waiting at least ${(delay / 1e3).toFixed(1)}s before retry ${retries}/${maxRateLimitRetries}...`);
+      await waitWithSignal(pause, options.signal);
     }
   }
 
@@ -1193,11 +1262,6 @@ SOFTWARE.
     const key = incoming.userId ? `u:${incoming.userId}` : incoming.channelId ? `c:${incoming.channelId}` : "";
     if (!key) return;
     const previous = oldKey ? map[oldKey] || {} : map[key] || {};
-    if (oldKey && oldKey !== key) {
-      delete map[oldKey];
-      if (previous.userId) indexes.byUser.delete(previous.userId);
-      if (previous.channelId) indexes.byChannel.delete(previous.channelId);
-    }
     const merged = {
       userId: incoming.userId || previous.userId || "",
       channelId: incoming.channelId || previous.channelId || "",
@@ -1214,6 +1278,9 @@ SOFTWARE.
       sentCountExact: incoming.sentCountExact === true || previous.sentCountExact === true,
       verifiedSent: incoming.verifiedSent === true || previous.verifiedSent === true
     };
+    if (oldKey && oldKey !== key) delete map[oldKey];
+    if (previous.userId && previous.userId !== merged.userId && indexes.byUser.get(previous.userId) === oldKey) indexes.byUser.delete(previous.userId);
+    if (previous.channelId && previous.channelId !== merged.channelId && indexes.byChannel.get(previous.channelId) === oldKey) indexes.byChannel.delete(previous.channelId);
     map[key] = merged;
     if (merged.userId) indexes.byUser.set(merged.userId, key);
     if (merged.channelId) indexes.byChannel.set(merged.channelId, key);
@@ -1306,6 +1373,14 @@ SOFTWARE.
       return Number(data.total_results || 0);
     }
   }
+  async function closeTemporaryDm(token, channelId) {
+    try {
+      const response = await apiFetch(`${API}/channels/${channelId}`, { method: "DELETE", headers: { Authorization: token } });
+      if (!response.ok && response.status !== 404) throw new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      throw new Error(`Could not close the temporarily opened DM. It may remain open in your DM list. ${error.message || error}`, { cause: error });
+    }
+  }
   async function verifyPerson(token, selfId, userId, knownChannelId, wasOpen) {
     let channelId = knownChannelId || "";
     let temporarilyOpened = false;
@@ -1325,12 +1400,7 @@ SOFTWARE.
       const count = await sentCountForChannel(token, selfId, channelId);
       return { count, channelId };
     } finally {
-      if (temporarilyOpened && channelId) {
-        try {
-          await apiFetch(`${API}/channels/${channelId}`, { method: "DELETE", headers: { Authorization: token } });
-        } catch {
-        }
-      }
+      if (temporarilyOpened && channelId) await closeTemporaryDm(token, channelId);
     }
   }
 
@@ -1580,12 +1650,14 @@ SOFTWARE.
   // src/features/history/import-package.js
   async function importPackage(fileList, { $, getHistory, getIdentity, setPackageInfo, persist, render }) {
     const history = getHistory();
+    const isCurrent = () => getHistory() === history;
     const files = [...fileList || []];
     if (!files.length) return;
     $("#dmh-import").disabled = true;
     $("#dmh-summary").textContent = `Indexing ${files.length} package files locally\u2026`;
     try {
       const me = await getIdentity();
+      if (!isCurrent()) return;
       const selfId = me?.user?.id || "";
       const pathOf = (file) => String(file.webkitRelativePath || file.name).replace(/\\/g, "/");
       const folderOf = (path) => path.slice(0, path.lastIndexOf("/")).toLowerCase();
@@ -1593,11 +1665,13 @@ SOFTWARE.
       const channelFiles = [];
       const messageFilesByFolder = /* @__PURE__ */ new Map();
       for (const file of files) {
+        if (!isCurrent()) return;
         const path = pathOf(file);
         const lower = path.toLowerCase();
         if (`/${lower}`.endsWith("/messages/index.json")) {
           try {
             const obj = JSON.parse(await file.text());
+            if (!isCurrent()) return;
             for (const [id, label] of Object.entries(obj || {})) {
               if (typeof label === "string") index.set(String(id), label);
             }
@@ -1639,10 +1713,12 @@ SOFTWARE.
       let processed = 0;
       let lastSavedAt = Date.now();
       for (const { file, path } of channelFiles) {
+        if (!isCurrent()) return;
         processed++;
         if (processed % 25 === 0) {
           $("#dmh-summary").textContent = `Processing package conversations ${processed}/${channelFiles.length}\u2026`;
           await new Promise(requestAnimationFrame);
+          if (!isCurrent()) return;
         }
         let ch;
         try {
@@ -1650,6 +1726,7 @@ SOFTWARE.
         } catch {
           continue;
         }
+        if (!isCurrent()) return;
         const folder = path.slice(0, path.lastIndexOf("/"));
         const channelId = String(ch?.id || folder.match(/(?:^|\/)c?(\d{15,22})$/)?.[1] || "");
         const label = index.get(channelId) || "";
@@ -1658,6 +1735,7 @@ SOFTWARE.
         const group = type === "GROUP_DM" || type === "3";
         if (!direct || group) continue;
         const count = await countSentMessages(folder);
+        if (!isCurrent()) return;
         if (count === null) continue;
         if (count <= 0) {
           removeHistoryMatch(history, "", channelId);
@@ -1680,6 +1758,7 @@ SOFTWARE.
           lastSavedAt = Date.now();
         }
       }
+      if (!isCurrent()) return;
       saveHistory(history);
       setPackageInfo({
         importedAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1696,7 +1775,8 @@ SOFTWARE.
   }
 
   // src/ui/confirm.js
-  function askPopup({ title = "Confirm", message = "", details = "", yesText = "Yes", noText = "No", danger = false, render, getResult, onNo } = {}) {
+  function askPopup({ title = "Confirm", message = "", details = "", yesText = "Yes", noText = "No", danger = false, render, getResult, onNo, signal } = {}) {
+    if (signal?.aborted) return Promise.resolve(false);
     return new Promise((resolve) => {
       const overlay = document.createElement("div");
       overlay.className = "dmd-confirm-overlay";
@@ -1739,25 +1819,34 @@ SOFTWARE.
         if (done) return;
         done = true;
         document.removeEventListener("keydown", onKey, true);
+        signal?.removeEventListener("abort", onAbort);
         overlay.remove();
         if (previousFocus?.isConnected) previousFocus.focus();
         resolve(value && getResult ? getResult() : value);
       };
       const onKey = (e) => {
+        if (e.key !== "Tab" && e.key !== "Escape" && !(e.key === "Enter" && (e.metaKey || e.ctrlKey))) return;
+        const dialogs = document.querySelectorAll(".dmd-confirm-overlay");
+        if (dialogs[dialogs.length - 1] !== overlay) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
         if (e.key === "Tab") {
           const controls = [...box.querySelectorAll('button,input,select,[tabindex="0"]')].filter((node) => !node.disabled);
           const index = controls.indexOf(document.activeElement);
-          e.preventDefault();
           controls[(index + (e.shiftKey ? -1 : 1) + controls.length) % controls.length]?.focus();
         }
         if (e.key === "Escape") finish(false);
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !yes.disabled) finish(true);
       };
+      const onAbort = () => finish(false);
+      signal?.addEventListener("abort", onAbort, { once: true });
       no.onclick = () => {
         onNo?.();
         finish(false);
       };
-      yes.onclick = () => finish(true);
+      yes.onclick = () => {
+        if (!yes.disabled) finish(true);
+      };
       overlay.onclick = (e) => {
         if (e.target === overlay) finish(false);
       };
@@ -1916,14 +2005,23 @@ SOFTWARE.
           open.className = "dmh-button green";
           open.textContent = "Open DM";
           open.onclick = async () => {
-            if (!me) me = await identity();
-            if (!me) return alert("Could not get a valid Discord authorization token.");
-            const r = await apiFetch(`${API}/users/@me/channels`, { method: "POST", headers: { Authorization: me.token, "Content-Type": "application/json" }, body: JSON.stringify({ recipient_id: entry.userId }) });
-            if (!r.ok) return alert(`Discord could not reopen this DM (HTTP ${r.status}).`);
-            const ch = await r.json();
-            merge(history, { userId: entry.userId, channelId: ch.id, sources: ["open"], sentCount: entry.sentCount, sentCountExact: entry.sentCountExact, verifiedSent: true, seenAt: (/* @__PURE__ */ new Date()).toISOString() });
-            saveHistory(history);
-            location.href = `/channels/@me/${ch.id}`;
+            const openingHistory = history;
+            try {
+              const currentIdentity = me || await identity();
+              if (history !== openingHistory) return;
+              me = currentIdentity;
+              if (!me) return alert("Could not get a valid Discord authorization token.");
+              const r = await apiFetch(`${API}/users/@me/channels`, { method: "POST", headers: { Authorization: me.token, "Content-Type": "application/json" }, body: JSON.stringify({ recipient_id: entry.userId }) });
+              if (history !== openingHistory) return;
+              if (!r.ok) return alert(`Discord could not reopen this DM (HTTP ${r.status}).`);
+              const ch = await r.json();
+              if (history !== openingHistory) return;
+              merge(history, { userId: entry.userId, channelId: ch.id, sources: ["open"], sentCount: entry.sentCount, sentCountExact: entry.sentCountExact, verifiedSent: true, seenAt: (/* @__PURE__ */ new Date()).toISOString() });
+              saveHistory(history);
+              location.href = `/channels/@me/${ch.id}`;
+            } catch (error) {
+              if (history === openingHistory) alert(`Discord could not reopen this DM: ${error?.message || error}`);
+            }
           };
           actions.appendChild(open);
         }
@@ -1956,24 +2054,26 @@ SOFTWARE.
       refreshing = true;
       $("#dmh-refresh").disabled = true;
       $("#dmh-summary").textContent = "Loading Discord DM data\u2026";
+      const refreshingHistory = history;
+      let dirty = 0;
       try {
-        me = await identity();
+        const refreshedIdentity = await identity();
+        if (history !== refreshingHistory) return;
+        me = refreshedIdentity;
         if (!me) {
           $("#dmh-summary").textContent = "Could not get a valid Discord authorization token.";
           return;
         }
         const openByUser = /* @__PURE__ */ new Map();
-        try {
-          const r = await apiFetch(`${API}/users/@me/channels`, { headers: { Authorization: me.token } });
-          if (r.ok) {
-            const channels = await r.json();
-            for (const ch of Array.isArray(channels) ? channels : []) {
-              if (ch?.type !== 1) continue;
-              const u = ch.recipients?.find?.((v) => v?.id && v.id !== me.user.id);
-              if (u) openByUser.set(u.id, { channelId: ch.id, user: u });
-            }
-          }
-        } catch {
+        const r = await apiFetch(`${API}/users/@me/channels`, { headers: { Authorization: me.token } });
+        if (history !== refreshingHistory) return;
+        if (!r.ok) throw new Error(`Could not load open DMs (HTTP ${r.status}).`);
+        const channels = await r.json();
+        if (history !== refreshingHistory) return;
+        for (const ch of Array.isArray(channels) ? channels : []) {
+          if (ch?.type !== 1) continue;
+          const u = ch.recipients?.find?.((v) => v?.id && v.id !== me.user.id);
+          if (u) openByUser.set(u.id, { channelId: ch.id, user: u });
         }
         const candidates = /* @__PURE__ */ new Map();
         for (const [userId, data] of openByUser) candidates.set(userId, { userId, channelId: data.channelId, user: data.user, wasOpen: true, dmRank: null, source: "open" });
@@ -1984,11 +2084,12 @@ SOFTWARE.
         }
         const all = [...candidates.values()];
         let done = 0;
-        let dirty = 0;
         for (const c of all) {
+          if (history !== refreshingHistory) return;
           done++;
           $("#dmh-summary").textContent = `Verifying sent-message history ${done}/${all.length}\u2026`;
           const result = await verifyPerson(me.token, me.user.id, c.userId, c.channelId, c.wasOpen);
+          if (history !== refreshingHistory) return;
           if (!result || result.count === null) {
             await sleep(200);
             continue;
@@ -2026,8 +2127,14 @@ SOFTWARE.
           }
           await sleep(250);
         }
+        if (history !== refreshingHistory) return;
         if (dirty) saveHistory(history);
         render();
+      } catch (error) {
+        if (history !== refreshingHistory) return;
+        if (dirty) saveHistory(history);
+        render(false);
+        $("#dmh-summary").textContent = `Refresh stopped: ${error?.message || error}`;
       } finally {
         $("#dmh-refresh").disabled = false;
         refreshing = false;
@@ -2166,20 +2273,28 @@ SOFTWARE.
 
   // src/discord/deleter-auth.js
   var authCache2 = null;
-  async function validateToken(token) {
+  async function validateToken(token, { log = () => {
+  }, stopCheck = () => false, strict = false, signal } = {}) {
     if (!token) return null;
     try {
-      const r = await fetch(`${API}/users/@me`, { headers: { Authorization: token } });
-      if (!r.ok) return null;
-      return await r.json();
-    } catch {
+      const r = await apiFetch(`${API}/users/@me`, { headers: { Authorization: token }, signal }, log, stopCheck, { minIntervalMs: 1e3 });
+      if (stopCheck()) throw new RunStoppedError();
+      if (!r.ok) {
+        if (strict && r.status !== 401) throw new Error(`Authorization check failed with HTTP ${r.status}. Export stopped.`);
+        return null;
+      }
+      return await waitWithSignal(r.json(), signal);
+    } catch (error) {
+      if (strict || error instanceof RunStoppedError) throw error;
       return null;
     }
   }
   function invalidateAuth2() {
     authCache2 = null;
   }
-  async function resolveToken(preferred = "") {
+  async function resolveToken(preferred = "", requestOptions = {}) {
+    requestOptions.signal?.throwIfAborted();
+    if (requestOptions.stopCheck?.()) throw new RunStoppedError();
     const now = Date.now();
     if (authCache2 && now - authCache2.at < AUTH_CACHE_TTL && (!preferred || preferred === authCache2.token)) {
       return authCache2.identity;
@@ -2195,12 +2310,13 @@ SOFTWARE.
     add(preferred);
     for (const token of tokenCandidates()) add(token);
     for (const token of candidates) {
-      const user = await validateToken(token);
+      const user = await validateToken(token, requestOptions);
       if (user?.id) {
         const identity2 = { token, user };
         authCache2 = { at: now, token, identity: identity2 };
         return identity2;
       }
+      if (requestOptions.strict) break;
     }
     invalidateAuth2();
     return null;
@@ -2650,74 +2766,6 @@ SOFTWARE.
     setTimeout(() => URL.revokeObjectURL(url), 1500);
   }
 
-  // src/ui/export-selection.js
-  function askExportSelection(conversations) {
-    const selected = /* @__PURE__ */ new Set();
-    let format = "json";
-    return askPopup({
-      title: "Export Conversations",
-      message: "Choose conversations and a file format. The selected Before/After range applies.",
-      yesText: "Export",
-      noText: "Cancel",
-      getResult: () => ({ conversations: conversations.filter((_, index) => selected.has(index)), format }),
-      render: ({ box, yes }) => {
-        yes.disabled = true;
-        const all = document.createElement("button");
-        all.type = "button";
-        all.className = "dmd-btn";
-        all.textContent = "Select all";
-        all.disabled = !conversations.length;
-        const list = document.createElement("div");
-        list.className = "dmd-export-list";
-        list.onchange = (event) => {
-          const input = event.target, index = Number(input.value);
-          if (input.checked) selected.add(index);
-          else selected.delete(index);
-          yes.disabled = !selected.size;
-        };
-        conversations.forEach((item, index) => {
-          const label = document.createElement("label");
-          label.className = "dmd-check";
-          const input = document.createElement("input");
-          input.type = "checkbox";
-          input.value = String(index);
-          label.append(input, document.createTextNode(item.label || item.channelId));
-          list.append(label);
-        });
-        all.onclick = () => {
-          list.querySelectorAll("input").forEach((input) => {
-            input.checked = true;
-            selected.add(Number(input.value));
-          });
-          yes.disabled = !selected.size;
-        };
-        const formats = document.createElement("fieldset");
-        formats.className = "dmd-export-formats";
-        const legend = document.createElement("legend");
-        legend.textContent = "File format";
-        formats.append(legend);
-        for (const value of ["json", "csv"]) {
-          const label = document.createElement("label");
-          label.className = "dmd-check";
-          const input = document.createElement("input");
-          input.type = "radio";
-          input.name = "dmd-export-format";
-          input.value = value;
-          input.checked = value === format;
-          input.onchange = () => {
-            if (input.checked) format = value;
-          };
-          label.append(input, document.createTextNode(value.toUpperCase()));
-          formats.append(label);
-        }
-        box.append(all, list, formats);
-      }
-    });
-  }
-
-  // src/utils/run-state.js
-  var runState = { stopped: false, reactionStopped: false, multiStopped: false };
-
   // src/features/asset-filters.js
   function compilePattern(source, flags = "i", label = "Regular expression") {
     source = String(source || "").trim();
@@ -2835,8 +2883,8 @@ ${asset.url}`)) return false;
     if (options.channelId && message.channel_id !== options.channelId) return false;
     if (![0, 6, 19].includes(message.type)) return false;
     if (!/^\d+$/.test(String(message.id || ""))) return false;
-    if (options.minId && BigInt(message.id) <= BigInt(options.minId)) return false;
-    if (options.maxId && BigInt(message.id) >= BigInt(options.maxId)) return false;
+    if (options.minId && compareMessageIds(message.id, options.minId) <= 0) return false;
+    if (options.maxId && compareMessageIds(message.id, options.maxId) >= 0) return false;
     const matchMode = (mode, value) => mode === "any" || (mode === "with" ? value : !value);
     if (options.linkMode !== "any") {
       const hasLink = /https?:\/\/\S+/i.test(message.content || "") || (message.embeds || []).some((embed) => !!embed.url);
@@ -2886,6 +2934,8 @@ ${asset.url}`)) return false;
   }
   function compactExportMessage(message) {
     return {
+      // Keep the original response, including fields added by Discord in future.
+      raw: message,
       id: message.id,
       timestamp: message.timestamp,
       editedTimestamp: message.edited_timestamp || null,
@@ -2924,7 +2974,20 @@ ${asset.url}`)) return false;
       referencedMessage: compactReferencedMessage(message.referenced_message)
     };
   }
-  async function exportConversationData({ token, guildId, channelId, minId, maxId, label, log, stopCheck = () => false }) {
+  function validateExportRange({ minId = "", maxId = "" } = {}) {
+    minId = String(minId).trim();
+    maxId = String(maxId).trim();
+    const boundary = (value) => {
+      const id = toSnowflake(value);
+      if (value && (!id || !/^\d+$/.test(id))) throw new Error("Enter a valid date/time or message ID.");
+      return id;
+    };
+    const after = boundary(minId), before = boundary(maxId);
+    if (after && before && BigInt(after) >= BigInt(before)) throw new Error("After must be earlier than Before.");
+    return { minId, maxId };
+  }
+  async function exportConversationData({ token, guildId, channelId, minId, maxId, label, log, stopCheck = () => false, signal }) {
+    ({ minId, maxId } = validateExportRange({ minId, maxId }));
     const afterSnowflake = minId ? toSnowflake(minId) : "";
     let beforeSnowflake = maxId ? toSnowflake(maxId) : "";
     let afterBig = null;
@@ -2939,7 +3002,7 @@ ${asset.url}`)) return false;
       const url = `${API}/channels/${channelId}/messages?limit=100${beforeSnowflake ? `&before=${beforeSnowflake}` : ""}`;
       let response;
       try {
-        response = await apiFetch(url, { headers: { Authorization: token } }, log, stopCheck);
+        response = await apiFetch(url, { headers: { Authorization: token }, signal }, log, stopCheck, { minIntervalMs: 1e3 });
       } catch (error) {
         if (error instanceof RunStoppedError) break;
         throw error;
@@ -2951,15 +3014,17 @@ ${asset.url}`)) return false;
       }
       if (response.status === 403) throw new Error("Discord denied access to this conversation.");
       if (!response.ok) throw new Error(`Conversation export failed with HTTP ${response.status}.`);
-      const batch = await response.json();
-      if (!Array.isArray(batch) || !batch.length) break;
+      const batch = await waitWithSignal(response.json(), signal);
+      if (stopCheck()) break;
+      if (!Array.isArray(batch)) throw new Error("Discord returned an invalid message page. Export stopped.");
+      if (!batch.length) break;
       page++;
       const beforeBig = beforeSnowflake ? BigInt(beforeSnowflake) : null;
       const seen = /* @__PURE__ */ new Set();
       let oldest = null;
       let reachedAfter = false;
       for (const message of batch) {
-        if (!/^\d+$/.test(String(message?.id || ""))) continue;
+        if (typeof message?.id !== "string" || !/^\d+$/.test(message.id)) throw new Error("Discord returned a malformed message. Export stopped.");
         let idBig = null;
         try {
           idBig = BigInt(message.id);
@@ -2978,9 +3043,9 @@ ${asset.url}`)) return false;
         if (oldest === null || idBig < oldest) oldest = idBig;
       }
       log("verb", `Export page ${page}: ${messages.length} messages collected.`);
-      if (reachedAfter || oldest === null) break;
+      if (reachedAfter) break;
+      if (oldest === null) throw new Error("Message pagination did not advance. Export stopped to avoid saving incomplete history.");
       beforeSnowflake = oldest.toString();
-      await sleep(rand(550, 900));
     }
     messages.sort((a, b) => compareMessageIds(a.id, b.id));
     return {
@@ -2996,7 +3061,7 @@ ${asset.url}`)) return false;
       messages
     };
   }
-  var csvColumns = ["guildId", "channelId", "conversation", "id", "timestamp", "editedTimestamp", "authorId", "username", "content", "type", "pinned", "attachments", "embeds", "reactions", "mentions", "referencedMessage"];
+  var csvColumns = ["guildId", "channelId", "conversation", "id", "timestamp", "editedTimestamp", "authorId", "username", "content", "type", "pinned", "attachments", "embeds", "reactions", "mentions", "referencedMessage", "messageData"];
   var nestedColumns = ["attachments", "embeds", "reactions", "mentions", "referencedMessage"];
   var csvCell = (value) => '"' + String(value ?? "").replace(/"/g, '""') + '"';
   function* conversationCsvRows(conversations, includeHeader = true) {
@@ -3015,7 +3080,8 @@ ${asset.url}`)) return false;
           message.content,
           message.type,
           message.pinned,
-          ...nestedColumns.map((key) => JSON.stringify(message[key] ?? null))
+          ...nestedColumns.map((key) => JSON.stringify(message[key] ?? null)),
+          JSON.stringify(message.raw ?? message)
         ].map(csvCell).join(",");
       }
     }
@@ -3064,6 +3130,385 @@ ${asset.url}`)) return false;
     checkStopped();
     if (chunks.length) flush();
     return new Blob(blobs, { type: format === "csv" ? "text/csv;charset=utf-8" : "application/json;charset=utf-8" });
+  }
+
+  // src/ui/export-selection.js
+  function askExportSelection(conversations, { range = {}, select = true, signal } = {}) {
+    const selected = new Set(select ? [] : conversations.map((_, index) => index));
+    let exportRange = { minId: range.minId || "", maxId: range.maxId || "" };
+    let format = "json", downloadAttachments = false;
+    return askPopup({
+      signal,
+      title: "Export Conversations",
+      message: "Choose conversations, a date or message range, and a file format. Blank boundaries export all readable history. All message data returned by Discord is included; enable attachment downloads to include the actual files in a ZIP (up to 4 GB).",
+      yesText: "Export",
+      noText: "Cancel",
+      getResult: () => ({ conversations: conversations.filter((_, index) => selected.has(index)), format, range: exportRange, downloadAttachments }),
+      render: ({ box, yes }) => {
+        const boundaries = [];
+        const error = document.createElement("div");
+        error.setAttribute("role", "alert");
+        const validate = () => {
+          try {
+            for (const { input, kind } of boundaries) {
+              if (input.validity.badInput) throw new Error("Complete the date and time or clear the boundary.");
+              if (kind.value === "id" && input.value && !/^\d+$/.test(input.value.trim())) throw new Error("Enter a numeric message ID.");
+            }
+            exportRange = validateExportRange(exportRange);
+            error.textContent = "";
+          } catch (issue) {
+            error.textContent = issue.message;
+          }
+          yes.disabled = !selected.size || !!error.textContent;
+        };
+        validate();
+        const all = document.createElement("button");
+        all.type = "button";
+        all.className = "dmd-btn";
+        all.textContent = "Select all";
+        all.disabled = !conversations.length;
+        const list = document.createElement("div");
+        list.className = "dmd-export-list";
+        list.onchange = (event) => {
+          const input = event.target, index = Number(input.value);
+          if (input.checked) selected.add(index);
+          else selected.delete(index);
+          validate();
+        };
+        conversations.forEach((item, index) => {
+          const label = document.createElement("label");
+          label.className = "dmd-check";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.value = String(index);
+          input.checked = selected.has(index);
+          label.append(input, document.createTextNode(item.label || item.channelId));
+          list.append(label);
+        });
+        all.onclick = () => {
+          list.querySelectorAll("input").forEach((input) => {
+            input.checked = true;
+            selected.add(Number(input.value));
+          });
+          validate();
+        };
+        const formats = document.createElement("fieldset");
+        formats.className = "dmd-export-formats";
+        const legend = document.createElement("legend");
+        legend.textContent = "File format";
+        formats.append(legend);
+        for (const value of ["json", "csv"]) {
+          const label = document.createElement("label");
+          label.className = "dmd-check";
+          const input = document.createElement("input");
+          input.type = "radio";
+          input.name = "dmd-export-format";
+          input.value = value;
+          input.checked = value === format;
+          input.onchange = () => {
+            if (input.checked) format = value;
+          };
+          label.append(input, document.createTextNode(value.toUpperCase()));
+          formats.append(label);
+        }
+        const ranges = document.createElement("fieldset");
+        ranges.className = "dmd-export-range";
+        const rangeLegend = document.createElement("legend");
+        rangeLegend.textContent = "Date & message range (local time)";
+        ranges.append(rangeLegend);
+        for (const [key, name] of [["minId", "After"], ["maxId", "Before"]]) {
+          const field = document.createElement("div");
+          field.className = "dmd-field";
+          const label = document.createElement("label");
+          label.htmlFor = `dmd-export-${key}`;
+          label.textContent = name;
+          const kind = document.createElement("select");
+          kind.setAttribute("aria-label", `${name} boundary type`);
+          for (const [value, text] of [["date", "Date & time"], ["id", "Message ID"]]) {
+            const option = document.createElement("option");
+            option.value = value;
+            option.textContent = text;
+            kind.append(option);
+          }
+          kind.value = /^\d+$/.test(exportRange[key]) ? "id" : "date";
+          const input = document.createElement("input");
+          input.id = label.htmlFor;
+          input.type = kind.value === "date" ? "datetime-local" : "text";
+          input.step = "any";
+          input.value = exportRange[key];
+          boundaries.push({ input, kind });
+          input.oninput = input.onchange = () => {
+            exportRange[key] = input.value;
+            validate();
+          };
+          kind.onchange = () => {
+            input.type = kind.value === "date" ? "datetime-local" : "text";
+            input.value = "";
+            exportRange[key] = "";
+            validate();
+          };
+          field.append(label, kind, input);
+          ranges.append(field);
+        }
+        const clear = document.createElement("button");
+        clear.type = "button";
+        clear.className = "dmd-btn";
+        clear.textContent = "All dates";
+        clear.onclick = () => {
+          ranges.querySelectorAll("input").forEach((input) => {
+            input.value = "";
+          });
+          exportRange = { minId: "", maxId: "" };
+          validate();
+        };
+        ranges.append(clear, error);
+        const attachmentLabel = document.createElement("label");
+        attachmentLabel.className = "dmd-check";
+        const attachmentToggle = document.createElement("input");
+        attachmentToggle.type = "checkbox";
+        attachmentToggle.id = "dmd-export-attachments";
+        attachmentToggle.onchange = () => {
+          downloadAttachments = attachmentToggle.checked;
+        };
+        attachmentLabel.append(attachmentToggle, document.createTextNode("Download actual attachments (ZIP)"));
+        box.append(all, list, ranges, formats, attachmentLabel);
+      }
+    });
+  }
+
+  // src/utils/run-state.js
+  var runState = { stopped: false, reactionStopped: false, multiStopped: false };
+
+  // src/utils/zip.js
+  var crcTable = Uint32Array.from({ length: 256 }, (_, index) => {
+    for (let bit = 0; bit < 8; bit++) index = index >>> 1 ^ (index & 1 ? 3988292384 : 0);
+    return index;
+  });
+  var ZipCapacityError = class extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "ZipCapacityError";
+    }
+  };
+  var checkCapacity = (count, size) => {
+    if (count >= 65535) throw new ZipCapacityError("Too many files for one ZIP. Export fewer conversations or a smaller date range.");
+    if (size >= 4294967295) throw new ZipCapacityError("ZIP exceeds 4 GB. Export fewer conversations or a smaller date range.");
+  };
+  var zipPath = (name, size) => {
+    if (!name || name.includes("\\") || name.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Invalid ZIP file path.");
+    if (!Number.isSafeInteger(size) || size < 0) throw new Error("Invalid ZIP file size.");
+    const path = new TextEncoder().encode(name);
+    if (path.length > 65535 || size >= 4294967295) throw new ZipCapacityError("ZIP exceeds 4 GB. Export fewer conversations or a smaller date range.");
+    return path;
+  };
+  function createZipBudget() {
+    const entries = /* @__PURE__ */ new Map();
+    let size = 22;
+    const checkFile = (name, bytes) => {
+      const previous = entries.get(name);
+      const entrySize = 76 + 2 * zipPath(name, bytes).length + bytes;
+      const nextSize = size - (previous ?? 0) + entrySize;
+      checkCapacity(entries.size + (previous === void 0 ? 1 : 0), nextSize);
+      return { entrySize, nextSize };
+    };
+    return {
+      checkFile(name, bytes) {
+        checkFile(name, bytes);
+      },
+      setFile(name, bytes) {
+        const { entrySize, nextSize } = checkFile(name, bytes);
+        entries.set(name, entrySize);
+        size = nextSize;
+      }
+    };
+  }
+  async function filesToZip(files, stopCheck = () => false) {
+    const check = () => {
+      if (stopCheck()) throw new RunStoppedError();
+    };
+    check();
+    checkCapacity(files.length, 22);
+    const paths = [];
+    let archiveSize = 22, yieldedAt = performance.now();
+    for (const { name, blob } of files) {
+      check();
+      const path = zipPath(name, blob.size);
+      paths.push(path);
+      archiveSize += 76 + 2 * path.length + blob.size;
+      checkCapacity(files.length, archiveSize);
+      if (performance.now() - yieldedAt >= 8) {
+        await sleep(0);
+        check();
+        yieldedAt = performance.now();
+      }
+    }
+    const parts = [], central = [];
+    let offset = 0, centralSize = 0;
+    for (const [index, { blob }] of files.entries()) {
+      check();
+      const path = paths[index];
+      let crc = 4294967295;
+      for (let start = 0; start < blob.size; start += 65536) {
+        check();
+        const bytes = new Uint8Array(await blob.slice(start, start + 65536).arrayBuffer());
+        for (let index2 = 0; index2 < bytes.length; index2++) crc = crc >>> 8 ^ crcTable[(crc ^ bytes[index2]) & 255];
+        if (performance.now() - yieldedAt >= 8) {
+          await sleep(0);
+          check();
+          yieldedAt = performance.now();
+        }
+      }
+      check();
+      crc = (crc ^ 4294967295) >>> 0;
+      const local = new Uint8Array(30), localView = new DataView(local.buffer);
+      localView.setUint32(0, 67324752, true);
+      localView.setUint16(4, 20, true);
+      localView.setUint16(6, 2048, true);
+      localView.setUint16(12, 33, true);
+      localView.setUint32(14, crc, true);
+      localView.setUint32(18, blob.size, true);
+      localView.setUint32(22, blob.size, true);
+      localView.setUint16(26, path.length, true);
+      const entry = new Uint8Array(46), view2 = new DataView(entry.buffer);
+      view2.setUint32(0, 33639248, true);
+      view2.setUint16(4, 20, true);
+      view2.setUint16(6, 20, true);
+      view2.setUint16(8, 2048, true);
+      view2.setUint16(14, 33, true);
+      view2.setUint32(16, crc, true);
+      view2.setUint32(20, blob.size, true);
+      view2.setUint32(24, blob.size, true);
+      view2.setUint16(28, path.length, true);
+      view2.setUint32(42, offset, true);
+      parts.push(local, path, blob);
+      central.push(entry, path);
+      offset += local.length + path.length + blob.size;
+      centralSize += entry.length + path.length;
+      if (performance.now() - yieldedAt >= 8) {
+        await sleep(0);
+        check();
+        yieldedAt = performance.now();
+      }
+    }
+    check();
+    checkCapacity(files.length, offset + centralSize + 22);
+    const end = new Uint8Array(22), view = new DataView(end.buffer);
+    view.setUint32(0, 101010256, true);
+    view.setUint16(8, files.length, true);
+    view.setUint16(10, files.length, true);
+    view.setUint32(12, centralSize, true);
+    view.setUint32(16, offset, true);
+    return new Blob([...parts, ...central, end], { type: "application/zip" });
+  }
+
+  // src/features/export-attachments.js
+  var createAttachmentDownloadState = () => ({ cache: /* @__PURE__ */ new Map(), failedUrls: /* @__PURE__ */ new Map(), consecutiveFailures: 0, suspendedReason: "" });
+  function* snapshotAttachmentSources(message, prefix = "", sourcePrefix = "") {
+    for (const [index, snapshot] of (message.message_snapshots || []).entries()) {
+      yield { attachments: snapshot.message?.attachments || [], prefix: `${prefix}snapshots/${index + 1}/`, source: `${sourcePrefix}message_snapshots[${index}].message.attachments` };
+    }
+  }
+  function* messageAttachmentEntries(message) {
+    const raw = message.raw || message;
+    const sources = [{ attachments: raw.attachments || message.attachments || [], prefix: "", source: "attachments" }, ...snapshotAttachmentSources(raw)];
+    if (raw.type === 21 && raw.referenced_message) {
+      sources.push({ attachments: raw.referenced_message.attachments || [], prefix: "referenced-message/", source: "referenced_message.attachments" });
+      sources.push(...snapshotAttachmentSources(raw.referenced_message, "referenced-message/", "referenced_message."));
+    }
+    for (const { attachments, prefix, source } of sources) {
+      for (const [index, attachment] of attachments.entries()) yield { attachment, index, prefix, source };
+    }
+  }
+  async function collectExportAttachments(conversation, { files, report, log, stopCheck = () => false, state = createAttachmentDownloadState(), signal, budget }) {
+    const check = () => {
+      if (stopCheck() || signal?.aborted) throw new RunStoppedError();
+    };
+    let yieldedAt = performance.now();
+    for (const message of conversation.messages) {
+      check();
+      if (performance.now() - yieldedAt >= 8) {
+        await sleep(0);
+        check();
+        yieldedAt = performance.now();
+      }
+      for (const { attachment, index, prefix, source } of messageAttachmentEntries(message)) {
+        check();
+        if (performance.now() - yieldedAt >= 8) {
+          await sleep(0);
+          check();
+          yieldedAt = performance.now();
+        }
+        const extension = String(attachment.filename || "").match(/\.[a-z0-9]{1,16}$/i)?.[0] || "";
+        const filename = safeFilePart(Array.from(String(attachment.filename || "")).filter((char) => char.codePointAt(0) >= 32 && char.codePointAt(0) !== 127).join("")).replace(/^\.+|\.+$/g, "") || "file";
+        const filePart = extension ? filename.replace(new RegExp(extension.replace(".", "\\.") + "$", "i"), "").slice(0, 80 - extension.length) + extension : filename;
+        const name = `attachments/${safeFilePart(conversation.channelId)}/${safeFilePart(message.id)}/${prefix}${index + 1}-${filePart}`;
+        const record = {
+          channelId: conversation.channelId,
+          messageId: message.id,
+          attachmentId: attachment.id || null,
+          filename: attachment.filename || "",
+          url: attachment.url || null,
+          path: name,
+          source
+        };
+        let cacheKey, failedKey;
+        try {
+          const url = new URL(attachment.url);
+          if (url.protocol !== "https:") throw new Error("Missing or invalid HTTPS attachment URL.");
+          const discordCdn = ["cdn.discordapp.com", "media.discordapp.net"].includes(url.hostname);
+          const canonical = new URL(url);
+          canonical.hash = "";
+          if (discordCdn) for (const key of ["ex", "is", "hm"]) canonical.searchParams.delete(key);
+          canonical.searchParams.sort();
+          cacheKey = canonical.href;
+          failedKey = url.href;
+          const cached = state.cache.get(cacheKey) || state.failedUrls.get(failedKey);
+          if (cached) {
+            report.push({ ...record, ...cached, status: cached.status === "downloaded" ? "reused" : cached.status });
+            continue;
+          }
+          if (state.suspendedReason) {
+            report.push({ ...record, path: null, status: "skipped", error: state.suspendedReason });
+            continue;
+          }
+          budget?.checkFile(name, Number.isSafeInteger(attachment.size) && attachment.size >= 0 ? attachment.size : 0);
+          log("verb", `Downloading attachment: ${attachment.filename || name}`);
+          const response = await apiFetch(url.href, { credentials: "omit", referrerPolicy: "no-referrer", signal }, log, stopCheck, { minIntervalMs: 1e3 });
+          check();
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const length = Number(response.headers.get("Content-Length"));
+          if (Number.isSafeInteger(length) && length >= 0) {
+            try {
+              budget?.checkFile(name, length);
+            } catch (error) {
+              response.body?.cancel().catch(() => {
+              });
+              throw error;
+            }
+          }
+          const blob = await waitWithSignal(response.blob(), signal);
+          check();
+          budget?.setFile(name, blob.size);
+          files.push({ name, blob });
+          const result = { path: name, status: "downloaded", size: blob.size };
+          state.cache.set(cacheKey, result);
+          state.consecutiveFailures = 0;
+          report.push({ ...record, ...result });
+        } catch (error) {
+          check();
+          if (error instanceof RunStoppedError || error instanceof ZipCapacityError) throw error;
+          const failure = { path: null, status: "failed", error: String(error.message || error) };
+          if (failedKey) state.failedUrls.set(failedKey, failure);
+          report.push({ ...record, ...failure });
+          state.consecutiveFailures++;
+          if (error instanceof RateLimitError || state.consecutiveFailures >= 3) {
+            state.suspendedReason = error instanceof RateLimitError ? error.message : "Three consecutive attachment failures. Further attachment requests stopped for this export.";
+            log("warn", state.suspendedReason);
+          }
+          log("warn", `Attachment unavailable: ${attachment.filename || name} (${error.message || error}).`);
+        }
+      }
+    }
   }
 
   // src/features/message-collection.js
@@ -3227,15 +3672,15 @@ ${options.overwriteText}` : `Delete up to ${total} messages matching your filter
     const { token, guildId, channelId, log, stopCheck, progress = () => {
     } } = options;
     const inaccessible = /* @__PURE__ */ Symbol("inaccessible");
-    const read = async (url, skipForbidden = false) => {
+    const read = async (url, forbiddenMessage = "") => {
       const response = await apiFetch(url, { headers: { Authorization: token }, cache: "no-store" }, log, stopCheck);
       if (stopCheck()) throw new RunStoppedError();
-      if (response.status === 403 && skipForbidden) {
-        log("warn", "Skipping a server channel whose message history Discord denied access to.");
+      if (response.status === 403 && forbiddenMessage) {
+        log("warn", forbiddenMessage);
         return inaccessible;
       }
       if (response.status === 401) invalidateAuth2();
-      if (!response.ok) throw new Error(`Fresh message scan failed (${response.status}). Check your access and try again.`);
+      if (!response.ok) throw new Error(`Fresh message scan failed (${response.status}) for ${new URL(url).pathname}. Check your access and try again.`);
       return response.json();
     };
     let channels = [{ id: channelId }];
@@ -3248,17 +3693,46 @@ ${options.overwriteText}` : `Delete up to ${total} messages matching your filter
       }
     }
     if (!channelId) {
-      const list = await read(`${API}/guilds/${guildId}/channels`);
+      const discovered = await read(`${API}/guilds/${guildId}/channels`, "Discord denied server channel discovery (403). Continuing with channels found in search. Select individual channels to scan new messages in channels missing from search.");
+      const list = discovered === inaccessible ? [] : discovered;
       if (!Array.isArray(list)) throw new Error("Discord returned an invalid channel list.");
       if (list.some((channel) => channel.guild_id && channel.guild_id !== guildId)) throw new Error("Discord returned channels for another server.");
       channels = list.filter((channel) => [0, 5].includes(channel.type) && (options.includeNsfw || !channel.nsfw));
-      const active = await read(`${API}/guilds/${guildId}/threads/active`);
-      if (!Array.isArray(active.threads)) throw new Error("Discord returned an invalid active thread list.");
+      const active = await read(`${API}/guilds/${guildId}/threads/active`, "Discord denied active thread discovery (403). Continuing with server channels and threads found in search. Select individual threads to scan new messages in threads missing from search.");
+      const threads = active === inaccessible ? [] : active.threads;
+      if (!Array.isArray(threads)) throw new Error("Discord returned an invalid active thread list.");
       const parents = new Map(list.map((channel) => [channel.id, channel]));
-      channels.push(...active.threads.filter((thread) => {
+      const threadsById = new Map(threads.map((thread) => [thread.id, thread]));
+      channels.push(...threads.filter((thread) => {
         const parent = parents.get(thread.parent_id);
         return parent && [10, 11, 12].includes(thread.type) && (!thread.guild_id || thread.guild_id === guildId) && (options.includeNsfw || !parent.nsfw);
       }));
+      const selected = new Set(channels.map((channel) => channel.id));
+      const readMetadata = async (id) => {
+        if (!/^\d{15,22}$/.test(String(id || ""))) throw new Error("Discord returned an invalid channel ID.");
+        const channel = await read(`${API}/channels/${id}`, `Discord denied channel metadata (403) for ${id}. Skipping its fresh history scan because its server and NSFW setting could not be checked.`);
+        if (channel === inaccessible) return null;
+        if (channel?.id !== id || channel.guild_id !== guildId) throw new Error("Discord returned a channel outside the selected server.");
+        return channel;
+      };
+      for (const id of newest.keys()) {
+        if (selected.has(id)) continue;
+        let thread = threadsById.get(id);
+        if (thread && (![10, 11, 12].includes(thread.type) || thread.guild_id && thread.guild_id !== guildId)) continue;
+        let channel = parents.get(id) || thread || await readMetadata(id);
+        if (!channel) continue;
+        if ([10, 11, 12].includes(channel.type)) {
+          thread = channel;
+          channel = parents.get(thread.parent_id) || await readMetadata(thread.parent_id);
+          if (!channel) continue;
+          if (![0, 5, 15, 16].includes(channel.type)) throw new Error("Discord returned an invalid thread parent.");
+          parents.set(channel.id, channel);
+        } else if (![0, 5].includes(channel.type)) throw new Error("Discord returned an unsupported message channel.");
+        if (options.includeNsfw || !channel.nsfw) {
+          channels.push({ id });
+          selected.add(id);
+        }
+      }
     }
     log("info", "Checking fresh channel history for messages that Discord search may not have indexed yet\u2026");
     for (const channel of channels) {
@@ -3270,7 +3744,7 @@ ${options.overwriteText}` : `Delete up to ${total} messages matching your filter
         if (before && lower && compareMessageIds(before, lower) <= 0) break;
         const query = new URLSearchParams({ limit: "100" });
         if (before) query.set("before", before);
-        const batch = await read(`${API}/channels/${channel.id}/messages?${query}`, !channelId);
+        const batch = await read(`${API}/channels/${channel.id}/messages?${query}`, channelId ? "" : `Discord denied message history for channel ${channel.id} (403). Skipping its fresh history scan; collected search matches will still be rechecked.`);
         if (batch === inaccessible) break;
         if (!Array.isArray(batch)) throw new Error("Discord returned invalid message history. No further messages changed.");
         if (!batch.length) break;
@@ -3472,6 +3946,10 @@ ${options.overwriteText}` : `Delete up to ${total} messages matching your filter
       if (thread.id !== channelId || ![10, 11, 12].includes(thread.type)) throw new Error("Select an individual thread for thread cleanup.");
       const parent = await readJson(`${API}/channels/${thread.parent_id}`, options);
       if (!(opts.allowAnyThread ? [0, 5, 15, 16] : [15, 16]).includes(parent.type) || parent.guild_id !== options.guildId || parent.id !== thread.parent_id) throw new Error("This thread does not belong to the selected forum/server.");
+      if (parent.nsfw && !options.includeNsfw) {
+        log("info", "Thread cleanup skipped because its parent is NSFW. Enable Include NSFW to clean it.");
+        return { done: true, ...stats };
+      }
       let before = options.maxId;
       while (!stopCheck()) {
         const query = new URLSearchParams({ limit: "100" });
@@ -5017,6 +5495,25 @@ Showing the first ${preview.length} of ${targets.length} reactions.` : ""),
   border-top: 0;
   padding-top: 4px;
 }
+.dmd-export-range {
+  border: 1px solid #545450;
+  border-radius: 4px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 12px;
+  margin: 12px 0;
+}
+.dmd-export-range legend {
+  color: #aaa9a2;
+}
+.dmd-export-range [role=alert] {
+  grid-column: 1/-1;
+  color: #ffaaa5;
+}
+.dmd-export-range .dmd-field {
+  min-width: 0;
+}
 `;
 
   // src/ui/deleter.js
@@ -5442,6 +5939,7 @@ Showing the first ${preview.length} of ${targets.length} reactions.` : ""),
       const body = logEntries.map((x) => `[${x.time}] [${String(x.type).toUpperCase()}] ${x.message}`).join("\n");
       downloadTextFile(`discord-log-${timeStampForFile()}.txt`, header + body);
     };
+    let activeExportController = null;
     const exportConversations = async ({ targets, stopId, stopped, setStopped, progress, filename, select = false }) => {
       if (cleanupBusy) return;
       let conversations;
@@ -5451,28 +5949,32 @@ Showing the first ${preview.length} of ${targets.length} reactions.` : ""),
         return log("error", error.message);
       }
       if (!conversations.length) return log("warn", "Select or queue at least one conversation to export.");
-      let format = "json";
       setCleanupBusy(true, stopId);
       setStopped(false);
+      const controller = new AbortController(), { signal } = controller;
+      activeExportController = controller;
       try {
-        const identity2 = await resolveToken($("#dmd-token").value.trim()) || await loadIdentity();
-        if (!identity2 || stopped()) return;
-        if (select) {
-          const choice = await askExportSelection(conversations);
-          if (!choice || stopped()) return;
-          conversations = choice.conversations;
-          format = choice.format;
-        }
-        const ranges = conversations.map((item) => getRange(item.channelId));
-        const approved = select || await askPopup({
-          title: conversations.length === 1 ? "Export conversation?" : "Export conversations?",
-          message: `Export all readable messages in the selected Before/After range from ${conversations.length} conversation${conversations.length === 1 ? "" : "s"}?`,
-          details: conversations.map((item) => item.label || item.channelId).join("\n"),
-          yesText: "Export",
-          noText: "Cancel"
-        });
-        if (!approved || stopped()) return;
-        const exports = [];
+        const choice = await askExportSelection(conversations, { range: getRange(conversations[0].channelId), select, signal });
+        if (!choice || stopped()) return;
+        conversations = choice.conversations;
+        const { format, range, downloadAttachments } = choice;
+        const identity2 = await resolveToken($("#dmd-token").value.trim(), { log, stopCheck: stopped, strict: true, signal });
+        if (stopped()) return;
+        if (!identity2) return log("error", "Authorization could not be validated. Refresh Discord and try again.");
+        const exports = [], attachmentFiles = [], attachmentReport = [];
+        const attachmentState = createAttachmentDownloadState();
+        const exportName = `discord-${safeFilePart(filename)}-${timeStampForFile()}`;
+        const messageFilename = `${exportName}.${format}`;
+        const jsonPrefix = format === "json" && conversations.length > 1 ? `{
+  "exportedAt": ${JSON.stringify((/* @__PURE__ */ new Date()).toISOString())},
+  "conversationCount": ${conversations.length},
+  "conversations": [
+` : "";
+        const jsonSuffix = jsonPrefix ? "\n  ]\n}" : "";
+        const archiveBudget = downloadAttachments ? createZipBudget() : null;
+        let exportBytes = jsonPrefix.length + jsonSuffix.length;
+        archiveBudget?.setFile(messageFilename, exportBytes);
+        archiveBudget?.setFile("attachments.json", 2);
         let messageCount = 0;
         progress(0, conversations.length);
         for (const [index, item] of conversations.entries()) {
@@ -5480,26 +5982,48 @@ Showing the first ${preview.length} of ${targets.length} reactions.` : ""),
           const data = await exportConversationData({
             token: identity2.token,
             ...item,
-            ...ranges[index],
+            ...range,
             log,
-            stopCheck: stopped
+            stopCheck: stopped,
+            signal
           });
           if (stopped()) return;
           const blob2 = await conversationToBlob(data, { format, includeCsvHeader: index === 0, stopCheck: stopped });
           if (stopped()) return;
+          const separator = exports.length ? format === "csv" ? "\r\n" : ",\n" : "";
+          if (format === "json" || blob2.size) {
+            exportBytes += separator.length + blob2.size;
+            archiveBudget?.setFile(messageFilename, exportBytes);
+          }
+          if (downloadAttachments) await collectExportAttachments(data, { files: attachmentFiles, report: attachmentReport, log, stopCheck: stopped, state: attachmentState, signal, budget: archiveBudget });
+          if (stopped()) return;
           messageCount += data.messageCount;
           if (format === "json" || blob2.size) {
-            if (exports.length) exports.push(format === "csv" ? "\r\n" : ",\n");
+            if (separator) exports.push(separator);
             exports.push(blob2);
           }
           progress(index + 1, conversations.length);
         }
-        const blob = format === "json" && conversations.length > 1 ? new Blob(['{\n  "exportedAt": ', JSON.stringify((/* @__PURE__ */ new Date()).toISOString()), ',\n  "conversationCount": ', String(conversations.length), ',\n  "conversations": [\n', ...exports, "\n  ]\n}"], { type: "application/json;charset=utf-8" }) : new Blob(exports, { type: format === "csv" ? "text/csv;charset=utf-8" : "application/json;charset=utf-8" });
-        downloadBlob(`discord-${safeFilePart(filename)}-${timeStampForFile()}.${format}`, blob);
+        const blob = new Blob([jsonPrefix, ...exports, jsonSuffix], { type: format === "csv" ? "text/csv;charset=utf-8" : "application/json;charset=utf-8" });
+        if (downloadAttachments) {
+          log("info", "Packaging messages and attachments...");
+          const reportBlob = new Blob([JSON.stringify(attachmentReport, null, 2)], { type: "application/json" });
+          archiveBudget.setFile("attachments.json", reportBlob.size);
+          const archive = await filesToZip([
+            { name: messageFilename, blob },
+            { name: "attachments.json", blob: reportBlob },
+            ...attachmentFiles
+          ], stopped);
+          if (stopped()) return;
+          downloadBlob(`${exportName}.zip`, archive);
+          const failed = attachmentReport.filter((item) => ["failed", "skipped"].includes(item.status)).length;
+          log(failed ? "warn" : "info", `Attachments: ${attachmentFiles.length} downloaded; ${failed} unavailable. See attachments.json in the ZIP.`);
+        } else downloadBlob(`${exportName}.${format}`, blob);
         log("success", `Export complete: ${conversations.length} conversations, ${messageCount} messages.`);
       } catch (error) {
         if (!stopped()) log("error", error?.message || error);
       } finally {
+        activeExportController = null;
         setCleanupBusy(false, stopId);
         setStopped(false);
       }
@@ -5546,6 +6070,7 @@ Showing the first ${preview.length} of ${targets.length} reactions.` : ""),
     });
     $("#dmd-stop").onclick = () => {
       runState.stopped = true;
+      activeExportController?.abort();
       log("warn", "Stop requested...");
     };
     $("#dmd-rx-stop").onclick = () => {
@@ -5818,6 +6343,7 @@ Showing the first ${preview.length} of ${targets.length} reactions.` : ""),
     };
     $("#dmd-multi-stop").onclick = () => {
       runState.multiStopped = true;
+      activeExportController?.abort();
       log("warn", "Stopping queue...");
     };
     $("#dmd-multi-start").onclick = async () => {
@@ -5921,6 +6447,7 @@ Showing the first ${preview.length} of ${targets.length} reactions.` : ""),
     };
     $("#dmd-forum-stop").onclick = () => {
       runState.stopped = true;
+      activeExportController?.abort();
       log("warn", "Stop requested...");
     };
     $("#dmd-forum-load").onclick = async () => {

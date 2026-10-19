@@ -4,7 +4,7 @@ import { countJsonMessages } from '../src/features/history/count-json.js';
 import { createHistoryView } from '../src/features/history/view.js';
 import { merge, removeHistoryMatch } from '../src/features/history/model.js';
 import { importPackage } from '../src/features/history/import-package.js';
-import { loadState, saveState } from '../src/features/history/storage.js';
+import { loadHistory, saveHistory, loadState, saveState } from '../src/features/history/storage.js';
 
 const streamed = (text, chunkSize = 1) => {
   const bytes = new TextEncoder().encode(text);
@@ -75,6 +75,29 @@ test('history pages and normalized searches reuse cached sorting and invalidate 
   assert.deepEqual(view({}), []);
 });
 
+test('history identifier changes retire old lookups without removing the updated conversation', () => {
+  const history = {};
+  merge(history, { userId: 'person', channelId: 'old-channel', verifiedSent: true, sentCount: 4 });
+  merge(history, { userId: 'person', channelId: 'current-channel' });
+  removeHistoryMatch(history, '', 'old-channel');
+  assert.equal(history['u:person'].channelId, 'current-channel');
+
+  // A later channel-only import for the retired ID is a separate entry.
+  merge(history, { channelId: 'old-channel', verifiedSent: true, sentCount: 2 });
+  assert.deepEqual(Object.keys(history).sort(), ['c:old-channel', 'u:person']);
+  assert.equal(history['u:person'].sentCount, 4);
+  removeHistoryMatch(history, '', 'current-channel');
+  assert.deepEqual(Object.keys(history), ['c:old-channel']);
+
+  // Adding and replacing a recipient still moves both current lookups.
+  merge(history, { userId: 'first-recipient', channelId: 'old-channel' });
+  merge(history, { userId: 'second-recipient', channelId: 'old-channel' });
+  removeHistoryMatch(history, 'first-recipient');
+  assert.deepEqual(Object.keys(history), ['u:second-recipient']);
+  removeHistoryMatch(history, '', 'old-channel');
+  assert.deepEqual(history, {});
+});
+
 test('large chunks are decoded in bounded slices while retaining complete message counts', async t => {
   const json = JSON.stringify([{ content: 'é😀"\\'.repeat(100000) }, { id: '123456789012345678' }]);
   const lengths = [];
@@ -140,5 +163,26 @@ test('package imports cache duplicate folder counts and retain saved evidence wh
   assert.equal(history[`u:${person}`].sentCount, 2);
   assert.equal(history[`c:${badChannel}`].sentCount, 7);
   assert.equal(info.importedCount, 2);
+  assert.equal($('#dmh-import').disabled, false);
+});
+
+test('clearing history during a package read prevents stale saves and skips later conversations', async t => {
+  storageFor(t);
+  let history = {}, release, completed = false, laterReads = 0;
+  const elements = new Map();
+  const $ = selector => { if (!elements.has(selector)) elements.set(selector, {}); return elements.get(selector); };
+  const files = [
+    { webkitRelativePath: 'messages/c234567890123456789/channel.json', text: () => new Promise(resolve => { release = () => resolve('{"id":"234567890123456789","type":"DM"}'); }) },
+    { webkitRelativePath: 'messages/c234567890123456789/messages.json', text: async () => { laterReads++; return '[{}]'; } },
+    { webkitRelativePath: 'messages/c345678901234567890/channel.json', text: async () => { laterReads++; return '{"id":"345678901234567890","type":"DM"}'; } }
+  ];
+  const imported = importPackage(files, { $, getHistory: () => history, getIdentity: async () => null, setPackageInfo: () => { completed = true; }, persist: () => { completed = true; }, render: () => { completed = true; } });
+  await Promise.resolve();
+  assert.equal(typeof release, 'function');
+  history = {}; saveHistory(history);
+  release(); await imported;
+  assert.equal(laterReads, 0);
+  assert.equal(completed, false);
+  assert.deepEqual(loadHistory(), {});
   assert.equal($('#dmh-import').disabled, false);
 });

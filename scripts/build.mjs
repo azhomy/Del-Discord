@@ -13,8 +13,8 @@ const header = `// ==UserScript==
 // @version      ${project.version}
 // @author       Del-Discord contributors
 // @icon         ${icon}
-// @homepageURL  https://github.com/zhomander/del-discord
-// @supportURL   https://github.com/zhomander/del-discord/issues
+// @homepageURL  https://github.com/azhomy/del-discord
+// @supportURL   https://github.com/azhomy/del-discord/issues
 // @license      MIT
 // @description  Personal message deletion, reaction removal, queues, exports, and DM history.
 // @match        https://discord.com/*

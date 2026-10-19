@@ -12,7 +12,7 @@ body:
     attributes:
       label: Del-Discord version
       description: Find it in your userscript manager or the panel header.
-      placeholder: v2.1.1
+      placeholder: v2.5.0
     validations:
       required: true
   - type: input

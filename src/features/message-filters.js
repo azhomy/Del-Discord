@@ -50,8 +50,8 @@ export function matchesMessage(message, options) {
   if (options.channelId && message.channel_id !== options.channelId) return false;
   if (![0, 6, 19].includes(message.type)) return false;
   if (!/^\d+$/.test(String(message.id || ''))) return false;
-  if (options.minId && BigInt(message.id) <= BigInt(options.minId)) return false;
-  if (options.maxId && BigInt(message.id) >= BigInt(options.maxId)) return false;
+  if (options.minId && compareMessageIds(message.id, options.minId) <= 0) return false;
+  if (options.maxId && compareMessageIds(message.id, options.maxId) >= 0) return false;
   const matchMode = (mode, value) => mode === 'any' || (mode === 'with' ? value : !value);
   if (options.linkMode !== 'any') {
     const hasLink = /https?:\/\/\S+/i.test(message.content || '') || (message.embeds || []).some(embed => !!embed.url);

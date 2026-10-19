@@ -3,7 +3,8 @@ import { toSnowflake } from '../utils/messages.js';
 import { API } from '../config.js';
 import { apiFetch, RunStoppedError } from '../discord/api.js';
 import { invalidateAuth } from '../discord/deleter-auth.js';
-import { rand, sleep } from '../utils/timing.js';
+import { sleep } from '../utils/timing.js';
+import { waitWithSignal } from '../utils/abort.js';
 import { compareMessageIds } from './message-filters.js';
 
 export function compactReferencedMessage(message) {
@@ -23,6 +24,8 @@ export function compactReferencedMessage(message) {
 
 export function compactExportMessage(message) {
   return {
+    // Keep the original response, including fields added by Discord in future.
+    raw: message,
     id: message.id,
     timestamp: message.timestamp,
     editedTimestamp: message.edited_timestamp || null,
@@ -62,7 +65,20 @@ export function compactExportMessage(message) {
   };
 }
 
-export async function exportConversationData({ token, guildId, channelId, minId, maxId, label, log, stopCheck = () => false }) {
+export function validateExportRange({ minId = '', maxId = '' } = {}) {
+  minId = String(minId).trim(); maxId = String(maxId).trim();
+  const boundary = value => {
+    const id = toSnowflake(value);
+    if (value && (!id || !/^\d+$/.test(id))) throw new Error('Enter a valid date/time or message ID.');
+    return id;
+  };
+  const after = boundary(minId), before = boundary(maxId);
+  if (after && before && BigInt(after) >= BigInt(before)) throw new Error('After must be earlier than Before.');
+  return { minId, maxId };
+}
+
+export async function exportConversationData({ token, guildId, channelId, minId, maxId, label, log, stopCheck = () => false, signal }) {
+  ({ minId, maxId } = validateExportRange({ minId, maxId }));
   const afterSnowflake = minId ? toSnowflake(minId) : '';
   let beforeSnowflake = maxId ? toSnowflake(maxId) : '';
   let afterBig = null;
@@ -77,7 +93,7 @@ export async function exportConversationData({ token, guildId, channelId, minId,
     const url = `${API}/channels/${channelId}/messages?limit=100${beforeSnowflake ? `&before=${beforeSnowflake}` : ''}`;
     let response;
     try {
-      response = await apiFetch(url, { headers: { Authorization: token } }, log, stopCheck);
+      response = await apiFetch(url, { headers: { Authorization: token }, signal }, log, stopCheck, { minIntervalMs: 1000 });
     } catch (error) {
       if (error instanceof RunStoppedError) break;
       throw error;
@@ -91,8 +107,10 @@ export async function exportConversationData({ token, guildId, channelId, minId,
     if (response.status === 403) throw new Error('Discord denied access to this conversation.');
     if (!response.ok) throw new Error(`Conversation export failed with HTTP ${response.status}.`);
 
-    const batch = await response.json();
-    if (!Array.isArray(batch) || !batch.length) break;
+    const batch = await waitWithSignal(response.json(), signal);
+    if (stopCheck()) break;
+    if (!Array.isArray(batch)) throw new Error('Discord returned an invalid message page. Export stopped.');
+    if (!batch.length) break;
 
     page++;
     const beforeBig = beforeSnowflake ? BigInt(beforeSnowflake) : null;
@@ -101,7 +119,7 @@ export async function exportConversationData({ token, guildId, channelId, minId,
     let reachedAfter = false;
 
     for (const message of batch) {
-      if (!/^\d+$/.test(String(message?.id || ''))) continue;
+      if (typeof message?.id !== 'string' || !/^\d+$/.test(message.id)) throw new Error('Discord returned a malformed message. Export stopped.');
       let idBig = null;
       try { idBig = BigInt(message.id); } catch {}
       if (idBig === null) continue;
@@ -119,9 +137,9 @@ export async function exportConversationData({ token, guildId, channelId, minId,
 
     log('verb', `Export page ${page}: ${messages.length} messages collected.`);
 
-    if (reachedAfter || oldest === null) break;
+    if (reachedAfter) break;
+    if (oldest === null) throw new Error('Message pagination did not advance. Export stopped to avoid saving incomplete history.');
     beforeSnowflake = oldest.toString();
-    await sleep(rand(550, 900));
   }
 
   messages.sort((a, b) => compareMessageIds(a.id, b.id));
@@ -140,7 +158,7 @@ export async function exportConversationData({ token, guildId, channelId, minId,
   };
 }
 
-const csvColumns = ['guildId', 'channelId', 'conversation', 'id', 'timestamp', 'editedTimestamp', 'authorId', 'username', 'content', 'type', 'pinned', 'attachments', 'embeds', 'reactions', 'mentions', 'referencedMessage'];
+const csvColumns = ['guildId', 'channelId', 'conversation', 'id', 'timestamp', 'editedTimestamp', 'authorId', 'username', 'content', 'type', 'pinned', 'attachments', 'embeds', 'reactions', 'mentions', 'referencedMessage', 'messageData'];
 const nestedColumns = ['attachments', 'embeds', 'reactions', 'mentions', 'referencedMessage'];
 const csvCell = value => '"' + String(value ?? '').replace(/"/g, '""') + '"';
 
@@ -150,7 +168,8 @@ function* conversationCsvRows(conversations, includeHeader = true) {
     for (const message of conversation.messages) {
       yield [conversation.guildId, conversation.channelId, conversation.label, message.id, message.timestamp,
         message.editedTimestamp, message.author?.id, message.author?.username, message.content, message.type,
-        message.pinned, ...nestedColumns.map(key => JSON.stringify(message[key] ?? null))].map(csvCell).join(',');
+        message.pinned, ...nestedColumns.map(key => JSON.stringify(message[key] ?? null)),
+        JSON.stringify(message.raw ?? message)].map(csvCell).join(',');
     }
   }
 }

@@ -6,6 +6,7 @@ import { saveHistory } from './storage.js';
 
 export async function importPackage(fileList, { $, getHistory, getIdentity, setPackageInfo, persist, render }) {
   const history = getHistory();
+  const isCurrent = () => getHistory() === history;
   const files = [...(fileList || [])];
   if (!files.length) return;
 
@@ -14,6 +15,7 @@ export async function importPackage(fileList, { $, getHistory, getIdentity, setP
 
   try {
     const me = await getIdentity();
+    if (!isCurrent()) return;
     const selfId = me?.user?.id || '';
     const pathOf = file => String(file.webkitRelativePath || file.name).replace(/\\/g, '/');
     const folderOf = path => path.slice(0, path.lastIndexOf('/')).toLowerCase();
@@ -24,12 +26,14 @@ export async function importPackage(fileList, { $, getHistory, getIdentity, setP
 
     // One O(n) pass over the package instead of scanning every file for every DM.
     for (const file of files) {
+      if (!isCurrent()) return;
       const path = pathOf(file);
       const lower = path.toLowerCase();
 
       if ((`/${lower}`).endsWith('/messages/index.json')) {
         try {
           const obj = JSON.parse(await file.text());
+          if (!isCurrent()) return;
           for (const [id, label] of Object.entries(obj || {})) {
             if (typeof label === 'string') index.set(String(id), label);
           }
@@ -74,16 +78,19 @@ export async function importPackage(fileList, { $, getHistory, getIdentity, setP
     let lastSavedAt = Date.now();
 
     for (const { file, path } of channelFiles) {
+      if (!isCurrent()) return;
       processed++;
       if (processed % 25 === 0) {
         $('#dmh-summary').textContent =
           `Processing package conversations ${processed}/${channelFiles.length}…`;
         await new Promise(requestAnimationFrame);
+        if (!isCurrent()) return;
       }
 
       let ch;
       try { ch = JSON.parse(await file.text()); }
       catch { continue; }
+      if (!isCurrent()) return;
 
       const folder = path.slice(0, path.lastIndexOf('/'));
       const channelId = String(ch?.id || folder.match(/(?:^|\/)c?(\d{15,22})$/)?.[1] || '');
@@ -95,6 +102,7 @@ export async function importPackage(fileList, { $, getHistory, getIdentity, setP
       if (!direct || group) continue;
 
       const count = await countSentMessages(folder);
+      if (!isCurrent()) return;
       if (count === null) continue;
       if (count <= 0) {
         removeHistoryMatch(history, '', channelId);
@@ -123,6 +131,7 @@ export async function importPackage(fileList, { $, getHistory, getIdentity, setP
 
     }
 
+    if (!isCurrent()) return;
     saveHistory(history);
     setPackageInfo({
       importedAt: new Date().toISOString(),

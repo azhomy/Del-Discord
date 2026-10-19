@@ -24,6 +24,8 @@ import { askExportSelection } from './export-selection.js';
 import { askPopup } from './confirm.js';
 import { runState } from '../utils/run-state.js';
 import { exportConversationData, conversationToBlob } from '../features/export.js';
+import { collectExportAttachments, createAttachmentDownloadState } from '../features/export-attachments.js';
+import { createZipBudget, filesToZip } from '../utils/zip.js';
 import { deleteMessages } from '../features/messages.js';
 import { listForumThreads, cleanupForumThread } from '../features/forum-threads.js';
 import { normalizeCleanupOptions } from '../features/message-filters.js';
@@ -380,54 +382,77 @@ export function initDeleter() {
     const body = logEntries.map(x => `[${x.time}] [${String(x.type).toUpperCase()}] ${x.message}`).join('\n');
     downloadTextFile(`discord-log-${timeStampForFile()}.txt`, header + body);
   };
+  let activeExportController = null;
   // All export entry points share confirmation, cancellation, ranges, and download handling.
   const exportConversations = async ({ targets, stopId, stopped, setStopped, progress, filename, select = false }) => {
     if (cleanupBusy) return;
     let conversations;
     try { conversations = targets(); } catch (error) { return log('error', error.message); }
     if (!conversations.length) return log('warn', 'Select or queue at least one conversation to export.');
-    let format = 'json';
     setCleanupBusy(true, stopId); setStopped(false);
+    const controller = new AbortController(), { signal } = controller;
+    activeExportController = controller;
     try {
-      const identity = await resolveToken($('#dmd-token').value.trim()) || await loadIdentity();
-      if (!identity || stopped()) return;
-      if (select) {
-        const choice = await askExportSelection(conversations);
-        if (!choice || stopped()) return;
-        conversations = choice.conversations; format = choice.format;
-      }
-      const ranges = conversations.map(item => getRange(item.channelId));
-      const approved = select || await askPopup({
-        title: conversations.length === 1 ? 'Export conversation?' : 'Export conversations?',
-        message: `Export all readable messages in the selected Before/After range from ${conversations.length} conversation${conversations.length === 1 ? '' : 's'}?`,
-        details: conversations.map(item => item.label || item.channelId).join('\n'),
-        yesText: 'Export', noText: 'Cancel',
-      });
-      if (!approved || stopped()) return;
-      const exports = [];
+      const choice = await askExportSelection(conversations, { range: getRange(conversations[0].channelId), select, signal });
+      if (!choice || stopped()) return;
+      conversations = choice.conversations;
+      const { format, range, downloadAttachments } = choice;
+      const identity = await resolveToken($('#dmd-token').value.trim(), { log, stopCheck: stopped, strict: true, signal });
+      if (stopped()) return;
+      if (!identity) return log('error', 'Authorization could not be validated. Refresh Discord and try again.');
+      const exports = [], attachmentFiles = [], attachmentReport = [];
+      const attachmentState = createAttachmentDownloadState();
+      const exportName = `discord-${safeFilePart(filename)}-${timeStampForFile()}`;
+      const messageFilename = `${exportName}.${format}`;
+      const jsonPrefix = format === 'json' && conversations.length > 1
+        ? `{\n  "exportedAt": ${JSON.stringify(new Date().toISOString())},\n  "conversationCount": ${conversations.length},\n  "conversations": [\n` : '';
+      const jsonSuffix = jsonPrefix ? '\n  ]\n}' : '';
+      const archiveBudget = downloadAttachments ? createZipBudget() : null;
+      let exportBytes = jsonPrefix.length + jsonSuffix.length;
+      // Reserve both required entries before requesting attachment payloads.
+      archiveBudget?.setFile(messageFilename, exportBytes);
+      archiveBudget?.setFile('attachments.json', 2);
       let messageCount = 0;
       progress(0, conversations.length);
       for (const [index, item] of conversations.entries()) {
         if (stopped()) return;
         const data = await exportConversationData({ token: identity.token, ...item,
-          ...ranges[index], log, stopCheck: stopped });
+          ...range, log, stopCheck: stopped, signal });
         if (stopped()) return;
         const blob = await conversationToBlob(data, { format, includeCsvHeader: index === 0, stopCheck: stopped });
         if (stopped()) return;
+        const separator = exports.length ? (format === 'csv' ? '\r\n' : ',\n') : '';
+        if (format === 'json' || blob.size) {
+          exportBytes += separator.length + blob.size;
+          archiveBudget?.setFile(messageFilename, exportBytes);
+        }
+        if (downloadAttachments) await collectExportAttachments(data, { files: attachmentFiles, report: attachmentReport, log, stopCheck: stopped, state: attachmentState, signal, budget: archiveBudget });
+        if (stopped()) return;
         messageCount += data.messageCount;
         if (format === 'json' || blob.size) {
-          if (exports.length) exports.push(format === 'csv' ? '\r\n' : ',\n');
+          if (separator) exports.push(separator);
           exports.push(blob);
         }
         progress(index + 1, conversations.length);
       }
-      const blob = format === 'json' && conversations.length > 1
-        ? new Blob(['{\n  "exportedAt": ', JSON.stringify(new Date().toISOString()), ',\n  "conversationCount": ', String(conversations.length), ',\n  "conversations": [\n', ...exports, '\n  ]\n}'], { type: 'application/json;charset=utf-8' })
-        : new Blob(exports, { type: format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8' });
-      downloadBlob(`discord-${safeFilePart(filename)}-${timeStampForFile()}.${format}`, blob);
+      const blob = new Blob([jsonPrefix, ...exports, jsonSuffix], { type: format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8' });
+      if (downloadAttachments) {
+        log('info', 'Packaging messages and attachments...');
+        const reportBlob = new Blob([JSON.stringify(attachmentReport, null, 2)], { type: 'application/json' });
+        archiveBudget.setFile('attachments.json', reportBlob.size);
+        const archive = await filesToZip([
+          { name: messageFilename, blob },
+          { name: 'attachments.json', blob: reportBlob },
+          ...attachmentFiles,
+        ], stopped);
+        if (stopped()) return;
+        downloadBlob(`${exportName}.zip`, archive);
+        const failed = attachmentReport.filter(item => ['failed', 'skipped'].includes(item.status)).length;
+        log(failed ? 'warn' : 'info', `Attachments: ${attachmentFiles.length} downloaded; ${failed} unavailable. See attachments.json in the ZIP.`);
+      } else downloadBlob(`${exportName}.${format}`, blob);
       log('success', `Export complete: ${conversations.length} conversations, ${messageCount} messages.`);
     } catch (error) { if (!stopped()) log('error', error?.message || error); }
-    finally { setCleanupBusy(false, stopId); setStopped(false); }
+    finally { activeExportController = null; setCleanupBusy(false, stopId); setStopped(false); }
   };
   $('#dmd-export-conversation').onclick = () => exportConversations({
     targets: () => {
@@ -452,7 +477,7 @@ export function initDeleter() {
       $('#dmd-forum-status').textContent = `Exported ${value}/${max}`;
     }, filename: 'forum-conversations',
   });
-  $('#dmd-stop').onclick = () => { runState.stopped = true; log('warn', 'Stop requested...'); };
+  $('#dmd-stop').onclick = () => { runState.stopped = true; activeExportController?.abort(); log('warn', 'Stop requested...'); };
   $('#dmd-rx-stop').onclick = () => { runState.reactionStopped = true; log('warn', 'Stop requested...'); };
 
   for (const side of ['after', 'before']) {
@@ -637,7 +662,7 @@ export function initDeleter() {
     }
     queue.clear(); setMultiProgress(0, 1, '');
   };
-  $('#dmd-multi-stop').onclick = () => { runState.multiStopped = true; log('warn', 'Stopping queue...'); };
+  $('#dmd-multi-stop').onclick = () => { runState.multiStopped = true; activeExportController?.abort(); log('warn', 'Stopping queue...'); };
   $('#dmd-multi-start').onclick = async () => {
     if (cleanupBusy) return log('info', 'The queue will continue automatically as jobs are added.');
     if (!queue.getItems().length) return log('error', 'The queue is empty.');
@@ -700,7 +725,7 @@ export function initDeleter() {
     $('#dmd-forum-list').appendChild(fragment);
     $('#dmd-forum-status').textContent = `${forumThreads.length} threads loaded`;
   };
-  $('#dmd-forum-stop').onclick = () => { runState.stopped = true; log('warn', 'Stop requested...'); };
+  $('#dmd-forum-stop').onclick = () => { runState.stopped = true; activeExportController?.abort(); log('warn', 'Stop requested...'); };
   $('#dmd-forum-load').onclick = async () => {
     if (cleanupBusy) return;
     setCleanupBusy(true, '#dmd-forum-stop'); runState.stopped = false;
